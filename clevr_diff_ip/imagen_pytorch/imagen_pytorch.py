@@ -15,7 +15,7 @@ from torch import nn, einsum
 from torch.cuda.amp import autocast
 from torch.special import expm1
 import torchvision.transforms as T
-
+import numpy as np
 import kornia.augmentation as K
 
 from einops import rearrange, repeat, reduce, pack, unpack
@@ -1079,7 +1079,8 @@ class UpsampleCombiner(nn.Module):
 # from arch.models import Querier128_with_mask
 # from arch.models import Querier32
 from arch.modules import SAUNet
-from arch.vector_querier_models import QueryEncoder
+from arch.vector_querier_models import QueryEncoder, QueryLinearEncoder, answer_queries
+
 # from arch.models import Querier128Flat
 
 class Unet(nn.Module):
@@ -1187,8 +1188,18 @@ class Unet(nn.Module):
         self.max_num_objects = max_num_objects
 
         if cond_dim is not None:
-            self.cond_embedding = nn.Embedding(self.max_num_attributes, cond_dim) # , max_norm=True
-            self.query_encoder = QueryEncoder(query_dim=cond_dim, num_layers=6, num_heads=8)
+            embed_dim = cond_dim
+            self.cond_embedding = nn.Embedding(self.max_num_attributes + 1, embed_dim, padding_idx=0) # , max_norm=True #TODO: review the in_channels
+            self.cond_embedding_neg = nn.Embedding(self.max_num_attributes + 1, embed_dim, padding_idx=0) # , max_norm=True #TODO: review the in_channels
+
+            # self.query_encoder = QueryEncoder(query_dim=cond_dim, num_layers=4, num_heads=4)
+            # self.query_encoder = QueryLinearEncoder(in_dim = cond_dim * self.max_num_objects, out_dim = cond_dim)
+            self.query_encoder = QueryLinearEncoder(attr_dim=self.max_num_attributes, n_obj=self.max_num_objects, out_dim=cond_dim, embed_dim=embed_dim,
+                                                    # reduce='linear_per_attr', add_answer='keep_pos'
+                                                    # reduce = 'pos_neg_max_max_pooling', add_answer = 'pos_neg'
+                                                    reduce = 'pos_neg_sum_max_pooling', add_answer = 'pos_neg'
+                                                    # reduce = 'pos_sum_pooling', add_answer = 'linear_merge' #None
+                                                    )
 
         if self.has_cond_image:
             if not self.all_queries:
@@ -1277,8 +1288,14 @@ class Unet(nn.Module):
 
         self.max_text_len = max_text_len
 
-        self.null_text_embed = nn.Parameter(torch.randn(1, max_text_len, cond_dim))
-        self.null_text_hidden = nn.Parameter(torch.randn(1, time_cond_dim))
+        # self.null_text_embed = nn.Parameter(torch.randn(1, max_text_len, cond_dim))
+        # self.null_text_hidden = nn.Parameter(torch.randn(1, time_cond_dim))
+
+        self.null_attr_hidden = nn.Parameter(torch.randn(1, time_cond_dim))
+        self.null_attr_embed = nn.Parameter(torch.randn(1, cond_dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, cond_dim))
+
+        # self.null_attr_embed = nn.Parameter(torch.zeros((1, max_text_len)), requires_grad=False)
 
         # for non-attention based text conditioning at all points in the network where time is also conditioned
 
@@ -1652,11 +1669,103 @@ class Unet(nn.Module):
 
         # Note: Attribute embeddings
         if exists(text_embeds):
-            attrs = text_embeds
-            attr_embeds = self.cond_embedding(attrs)
-            attr_embedding = self.query_encoder(attr_embeds)
 
-        # text conditioning
+            attrs = text_embeds
+            # attrs_2 = attrs.clone()
+
+            # Note: This is my own implementation of inconditionality --> All zeros, no colors. Commented the original implementation.
+            #  NOT CORRECT? WOULD INTERPRET 0s DIFFERENTLY. anyways maxpool would keep only zero tokens, so it could potentially work.
+            # attr_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device = device)
+            # attr_keep_mask = rearrange(attr_keep_mask, 'b -> b 1')
+            # null_attr_embed = self.null_attr_embed.to(attrs.dtype)
+            # attrs = torch.where(
+            #     attr_keep_mask,
+            #     attrs,
+            #     null_attr_embed
+            # )
+
+
+            # Option 1: All possible queries
+            max_prob = 1
+            all = np.random.uniform(0, 1)
+            if all < 0.5:
+                prob_ask = np.random.uniform(0, max_prob)
+            else:
+                prob_ask = max_prob
+            # prob_ask = 1 # Select for test.
+
+            # ops.random_sampling()
+            q_mask = torch.ones((batch_size, self.max_num_attributes, self.max_num_objects), device=text_embeds.device, dtype=attrs.dtype)
+            q_mask_bool = prob_mask_like((batch_size, self.max_num_attributes, self.max_num_objects), prob_ask, device=device)
+            q_mask = q_mask * q_mask_bool
+            q_all = torch.linspace(1, self.max_num_attributes, self.max_num_attributes, device=text_embeds.device, dtype=attrs.dtype)[None, :, None]
+            q = (q_mask * q_all).reshape(batch_size, -1)
+            q_pos, ans = answer_queries(q_mask.clone(), attrs.clone()) #q: [q x num_attr x max_obj], binary - gt_attrs: [b x max_obj]
+
+            # qpos_keep_mask = prob_mask_like(q_pos.shape, 1, device=device)  # - 0.3
+            # q_pos = torch.where(
+            #     qpos_keep_mask,
+            #     q_pos,
+            #     torch.zeros_like(q_pos)
+            # )
+            # attr_embeds = self.cond_embedding((q_pos.reshape(batch_size, -1)))
+
+            attr_embeds = self.cond_embedding(q)
+            attr_embeds_neg = self.cond_embedding_neg(q)
+            # TODO: Consider stop answering if "NO" has been reached.
+            attr_embeds_enc = self.query_encoder((attr_embeds, attr_embeds_neg), ans)
+
+            # Option 2: Only queries fitting in slots.
+            # q_keep_mask = prob_mask_like(attrs.shape, 1 - 0.3, device=device)  # - 0.3
+            # q = attrs_2.clone()
+            # q = torch.where(
+            #     q_keep_mask,
+            #     q,
+            #     torch.zeros_like(q)
+            # )
+
+            # Embed codes
+            # attr_embeds = self.cond_embedding(q)
+
+            # Aggregate (encode) attributes with a transformer. Note: Unused
+            # cls_token = self.cls_token.to(attr_embeds.dtype).repeat_interleave(batch_size, dim=0)
+            # attr_embeds = torch.cat([cls_token, attr_embeds], dim=1)
+
+            # Option 1: All possible queries
+            # attr_embeds = torch.cat([attr_embeds, ans[:, :, None]], dim=-1)
+            # attr_embeds_enc = self.query_encoder(attr_embeds, ans[:, :, None]) # reduce='cls'
+
+            # Option 2: Only queries fitting in slots.
+            # attr_embeds_enc = self.query_encoder(attr_embeds)
+
+            attr_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device = device)
+            attr_keep_mask_hidden = rearrange(attr_keep_mask, 'b -> b 1')
+
+            attr_tokens = attr_embeds_enc
+            # attr_tokens = self.text_to_cond(attr_embeds_enc) # Limit here the size
+            #
+            # null_attr_embed = self.null_attr_embed.to(attr_tokens.dtype) # for some reason pytorch AMP not working
+            #
+            # attr_tokens = torch.where(
+            #     attr_keep_mask_embed,
+            #     attr_tokens,
+            #     null_attr_embed
+            # )
+
+            attr_hiddens = self.to_text_non_attn_cond(attr_tokens)
+
+            null_attr_hidden = self.null_attr_hidden.to(t.dtype)
+
+            attr_hiddens = torch.where(
+                attr_keep_mask_hidden,
+                attr_hiddens,
+                null_attr_hidden
+            )
+            # # TODO: What is the point here? Why hiddens and embeds are masked twice
+
+            t = t + attr_hiddens
+
+            # text conditioning
         text_tokens = None
 
         # Note: Old Text embeds
@@ -1698,7 +1807,7 @@ class Unet(nn.Module):
         #         null_text_embed
         #     )
         #
-        #     if exists(self.attn_pool):
+        #     if exists(self.attn_pool): # WTH is this?
         #         text_tokens = self.attn_pool(text_tokens)
         #
         #     # extra non-attention conditioning by projecting and then summing text embeddings to time
@@ -2322,7 +2431,7 @@ class Imagen(nn.Module):
 
         assert not (self.condition_on_text and not exists(text_embeds)), 'text or text encodings must be passed into imagen if specified'
         assert not (not self.condition_on_text and exists(text_embeds)), 'imagen specified not to be conditioned on text, yet it is presented'
-        assert not (exists(text_embeds) and text_embeds.shape[-1] != self.text_embed_dim), f'invalid text embedding dimension being passed in (should be {self.text_embed_dim})'
+        # assert not (exists(text_embeds) and text_embeds.shape[-1] != self.text_embed_dim), f'invalid text embedding dimension being passed in (should be {self.text_embed_dim})'
 
         assert not (exists(inpaint_images) ^ exists(inpaint_masks)),  'inpaint images and masks must be both passed in to do inpainting'
 

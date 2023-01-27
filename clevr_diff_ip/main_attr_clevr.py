@@ -34,7 +34,7 @@ lt.monkey_patch()
 
 def parseargs():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--data', type=str, default='clevr')
     parser.add_argument('--batch_size', type=int, default=20) # 128
     parser.add_argument('--max_queries', type=int, default=50)
@@ -59,6 +59,9 @@ def parseargs():
     parser.add_argument('--gpu_id', type=str, default="0")
     parser.add_argument('--load_epoch', type=int, default=0)
     parser.add_argument('--test', type=bool, default=False)
+    parser.add_argument('--cond_scale', type=float, default=1)
+    parser.add_argument('--attribute', type=str, default="color")
+    parser.add_argument('--num_samples', type=int, default=1)
 
     args = parser.parse_args()
     if args.num_viz > args.batch_size:
@@ -95,14 +98,24 @@ def main(args):
     patch_size = 5
     qh = qw = 128 - patch_size + 1
     C = 3
+    cond_scale = args.cond_scale
+    attribute = args.attribute
+    max_num_objects = 5
+    if args.attribute == 'color':
+        max_num_attributes = 10
+    elif args.attribute == 'shape':
+        max_num_attributes = 5
+    else: raise NotImplementedError
+    attr_size = 256
 
     ## Data
     transform = transforms.Compose([transforms.ToTensor(),  
                                     transforms.Lambda(lambda x: x * 2 - 1),
                                     transforms.Resize(size=(H, W))
                                     ])
-    trainset = Clevr_with_attr(args.data_dir, split='train', transform=transform)
-    testset = Clevr_with_attr(args.data_dir, split='test', transform=transform)
+
+    trainset = Clevr_with_attr(args.data_dir, split='train', transform=transform, attribute=attribute, max_attributes=max_num_objects)
+    testset = Clevr_with_attr(args.data_dir, split='test', transform=transform, attribute=attribute, max_attributes=max_num_objects)
 
     # trainloader = DataLoader(trainset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
     testloader = DataLoader(testset, batch_size=4, num_workers=args.num_workers, pin_memory=True)
@@ -117,14 +130,17 @@ def main(args):
         sampling_mode = sampling_mode,
         max_num_queries = 20,
         max_rand_queries = 100,
-        max_num_attributes = 10,
+        max_num_attributes = max_num_attributes,
         max_num_objects = 5,
         image_embed_dim = 1024,
-        cond_dim = 512,
+        cond_on_text = True, # Needed (?)
+        text_embed_dim = attr_size, # Not sure if it's necessary, but a bunch of things are done with this
+        cond_dim = attr_size,
         dim_mults = (1, 2, 4, 8),
         num_resnet_blocks = 3,
         layer_attns = (False, False, False, True),
-        layer_cross_attns = (False, False, True, True),
+        layer_cross_attns = (True, True, True, True), # TODO: Checked all true
+        max_text_len = max_num_attributes
     )
     # cond_images_channels = 1 + C # S + GT Image
 
@@ -132,8 +148,9 @@ def main(args):
         unets = (unet1),
         image_sizes = (H),
         timesteps = 1000,
+        text_embed_dim = attr_size, # Not sure if it's necessary, but a bunch of things are done with this
+        cond_drop_prob=0.1
     )
-    # cond_drop_prob = 0.1
 
     trainer = ImagenTrainer(imagen,
                             warmup_steps = 1 * iters_per_epoch,
@@ -147,116 +164,145 @@ def main(args):
     tau_vals = np.linspace(args.tau_start, args.tau_end, args.epochs)
 
 
-    def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, query_size=(128, 128), epoch=0, max_query=100, log=False, full_queries=False):
+    # def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, query_size=(128, 128), epoch=0, max_query=100, log=False, full_queries=False):
+    #
+    #     q_list = []
+    #     qx_list = []
+    #     attn_list = []
+    #     im_list = []
+    #
+    #     _, attr_embeds = next(enumerate(testloader))
+    #     N, C, W, H = input_mask.shape
+    #     NULL_VAL = 0 #-10
+    #
+    #
+    #     if not log:
+    #         utils.save_images(input_x, os.path.join(model_dir_ckpt, 'GT_sample.png'), range=(-1,1))
+    #         utils.save_images(input_mask[:, :1] * torch.ones_like(input_x),
+    #                           os.path.join(model_dir_ckpt, 'GT_mask.png'), range=(0,1))
+    #     else:
+    #         pass
+    #
+    #
+    #     if full_queries:
+    #         sample_ids = [0]
+    #         for j in range(num_samples):
+    #             images = trainer.sample(cond_images=torch.cat([input_mask, input_x], dim=1), batch_size=input_mask.shape[0])
+    #             im_list.append(images.cpu())
+    #     else:
+    #         querier = trainer.imagen.unets[0].querier # Put to eval or torch nograd
+    #         if sample_ids == 'all':
+    #             sample_ids = list(np.arange(num_queries))
+    #         elif -1 in sample_ids:
+    #             sample_ids.remove(-1)
+    #             sample_ids.append(num_queries-1)
+    #
+    #         hq, wq = query_size
+    #         input_mask = resize_image_to(input_mask, hq + patch_size - 1)
+    #         masked_x = torch.zeros_like(input_mask) + NULL_VAL
+    #         mask = torch.zeros(N, hq*wq).to(device)
+    #
+    #         for i in range(num_queries):
+    #             # Save queries
+    #             # if i == 0:
+    #             #     plot_mask = ops.random_sampling(max_query, query_size[0]*query_size[1], N).reshape(N, 1, *query_size).clone()
+    #             # else:
+    #             #     plot_mask = mask.reshape(N, 1, *query_size).clone().cpu()
+    #
+    #             plot_mask = masked_x.clone()
+    #
+    #
+    #             plot_mask[plot_mask != NULL_VAL] = 1
+    #             plot_mask[plot_mask == NULL_VAL] = 0
+    #             # plot_mask_raw = plot_mask.clone()
+    #
+    #             plot_queries = resize_image_to(plot_mask * input_mask, input_x.shape[-2:])
+    #             plot_mask = resize_image_to(plot_mask, input_x.shape[-2:])
+    #             gaussian_blur = tv.transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
+    #
+    #             plot_queries = gaussian_blur(plot_queries)
+    #             plot_mask = gaussian_blur(plot_mask) # Gaussian blob
+    #
+    #             plot_queries[plot_queries > 0.02] = 1
+    #             plot_queries[plot_queries <= 0.02] = 0
+    #
+    #             plot_mask[plot_mask > 0.02] = 1
+    #             plot_mask[plot_mask <= 0.02] = 0
+    #
+    #             drawn_queries_x = torch.ones_like(plot_mask) * plot_queries + input_x * (1-plot_queries)
+    #             drawn_queries = torch.ones_like(plot_mask) * plot_mask + input_x * (1-plot_mask)
+    #
+    #             if not log:
+    #                 utils.save_images(drawn_queries, os.path.join(model_dir_ckpt, 'E{}_S{}_queries.png'.format(epoch,i)), range=(-1,1))
+    #             else:
+    #                 q_list.append(drawn_queries)
+    #                 qx_list.append(drawn_queries_x)
+    #
+    #             gt_input = resize_image_to(input_x, hq + patch_size - 1)
+    #             # gt_input = torch.cat([input_mask, resize_image_to(input_x, query_size)], dim=1)
+    #
+    #             # Save images
+    #             if i in sample_ids:
+    #
+    #                 for j in range(num_samples):
+    #                     images = trainer.sample(cond_images=torch.cat([masked_x, gt_input], dim=1), batch_size=input_mask.shape[0])
+    #                     if not log:
+    #                         utils.save_images(torch.ones_like(plot_mask) * plot_mask + images.cpu() * (1-plot_mask),
+    #                                           os.path.join(model_dir_ckpt, 'E{}_S{}_{}_sample_gen_wS.png'.format(epoch,i,j)), range=(-1,1))
+    #                     else:
+    #                         im_list.append(torch.ones_like(plot_mask) * plot_mask + images.cpu() * (1-plot_mask))
+    #
+    #             # Querier update
+    #             querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
+    #             with torch.no_grad():
+    #                 query_vec, attn = querier(querier_inputs, mask, return_attn=True)
+    #             mask[np.arange(N), query_vec.argmax(dim=1)] = 1.0
+    #             masked_x = ops.update_masked_image(masked_x, input_mask, query_vec.cpu(), patch_size=patch_size)
+    #             if log:
+    #                 attn_plot = attn.reshape(N, 1, *query_size).clone().cpu()
+    #                 attn_plot = resize_image_to(attn_plot, input_x.shape[-2:])
+    #                 attn_list.append(attn_plot)
+    #
+    #     if log:
+    #         if len(im_list)>0:
+    #             utils.log_images(torch.stack(im_list, dim=1).flatten(0,1), wandb,
+    #                              name='S_sample_gen_wS', range=(-1,1), nrow=len(sample_ids) * num_samples)
+    #         if len(q_list)>0:
+    #             utils.log_images(torch.stack(q_list, dim=1).flatten(0,1), wandb, name='S_q', range=(-1,1), nrow=num_queries)
+    #             utils.log_images(torch.stack(qx_list, dim=1).flatten(0,1), wandb, name='S_q(X)', range=(-1,1), nrow=num_queries)
+    #
+    #         if len(attn_list)>0:
+    #             utils.log_images(torch.stack(attn_list, dim=1).flatten(0,1), wandb, name='Q_attention', range=(0,1), nrow=num_queries)
 
-        q_list = []
-        qx_list = []
-        attn_list = []
+    def sample_with_gt(trainer, num_samples=1, cond_scale=3., epoch=0, log=True):
+
         im_list = []
 
-        _, (input_x, input_mask) = next(enumerate(testloader))
-        input_mask = input_mask[:, :1]
-        N, C, W, H = input_mask.shape
-        NULL_VAL = 0 #-10
+        _, (input_x, attr_embeds) = next(enumerate(testloader))
+        N, C, W, H = input_x.shape
 
+        text_table = wandb.Table(columns=["Attribute IDs"])
+        for i in range(N):
+            text_table.add_data(' '.join(str(e) for e in list(attr_embeds[i].numpy())))
+        wandb.log({"Attributes" : text_table})
 
         if not log:
             utils.save_images(input_x, os.path.join(model_dir_ckpt, 'GT_sample.png'), range=(-1,1))
-            utils.save_images(input_mask[:, :1] * torch.ones_like(input_x),
-                              os.path.join(model_dir_ckpt, 'GT_mask.png'), range=(0,1))
         else:
-            pass
+            im_list.append(input_x)
+            utils.log_images(input_x, wandb,
+                             name='GT images', range=(-1,1), nrow=1)
 
-
-        if full_queries:
-            sample_ids = [0]
-            for j in range(num_samples):
-                images = trainer.sample(cond_images=torch.cat([input_mask, input_x], dim=1), batch_size=input_mask.shape[0])
-                im_list.append(images.cpu())
-        else:
-            querier = trainer.imagen.unets[0].querier # Put to eval or torch nograd
-            if sample_ids == 'all':
-                sample_ids = list(np.arange(num_queries))
-            elif -1 in sample_ids:
-                sample_ids.remove(-1)
-                sample_ids.append(num_queries-1)
-
-            hq, wq = query_size
-            input_mask = resize_image_to(input_mask, hq + patch_size - 1)
-            masked_x = torch.zeros_like(input_mask) + NULL_VAL
-            mask = torch.zeros(N, hq*wq).to(device)
-
-            for i in range(num_queries):
-                # Save queries
-                # if i == 0:
-                #     plot_mask = ops.random_sampling(max_query, query_size[0]*query_size[1], N).reshape(N, 1, *query_size).clone()
-                # else:
-                #     plot_mask = mask.reshape(N, 1, *query_size).clone().cpu()
-
-                plot_mask = masked_x.clone()
-
-
-                plot_mask[plot_mask != NULL_VAL] = 1
-                plot_mask[plot_mask == NULL_VAL] = 0
-                # plot_mask_raw = plot_mask.clone()
-
-                plot_queries = resize_image_to(plot_mask * input_mask, input_x.shape[-2:])
-                plot_mask = resize_image_to(plot_mask, input_x.shape[-2:])
-                gaussian_blur = tv.transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
-
-                plot_queries = gaussian_blur(plot_queries)
-                plot_mask = gaussian_blur(plot_mask) # Gaussian blob
-
-                plot_queries[plot_queries > 0.02] = 1
-                plot_queries[plot_queries <= 0.02] = 0
-
-                plot_mask[plot_mask > 0.02] = 1
-                plot_mask[plot_mask <= 0.02] = 0
-
-                drawn_queries_x = torch.ones_like(plot_mask) * plot_queries + input_x * (1-plot_queries)
-                drawn_queries = torch.ones_like(plot_mask) * plot_mask + input_x * (1-plot_mask)
-
-                if not log:
-                    utils.save_images(drawn_queries, os.path.join(model_dir_ckpt, 'E{}_S{}_queries.png'.format(epoch,i)), range=(-1,1))
-                else:
-                    q_list.append(drawn_queries)
-                    qx_list.append(drawn_queries_x)
-
-                gt_input = resize_image_to(input_x, hq + patch_size - 1)
-                # gt_input = torch.cat([input_mask, resize_image_to(input_x, query_size)], dim=1)
-
-                # Save images
-                if i in sample_ids:
-
-                    for j in range(num_samples):
-                        images = trainer.sample(cond_images=torch.cat([masked_x, gt_input], dim=1), batch_size=input_mask.shape[0])
-                        if not log:
-                            utils.save_images(torch.ones_like(plot_mask) * plot_mask + images.cpu() * (1-plot_mask),
-                                              os.path.join(model_dir_ckpt, 'E{}_S{}_{}_sample_gen_wS.png'.format(epoch,i,j)), range=(-1,1))
-                        else:
-                            im_list.append(torch.ones_like(plot_mask) * plot_mask + images.cpu() * (1-plot_mask))
-
-                # Querier update
-                querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
-                with torch.no_grad():
-                    query_vec, attn = querier(querier_inputs, mask, return_attn=True)
-                mask[np.arange(N), query_vec.argmax(dim=1)] = 1.0
-                masked_x = ops.update_masked_image(masked_x, input_mask, query_vec.cpu(), patch_size=patch_size)
-                if log:
-                    attn_plot = attn.reshape(N, 1, *query_size).clone().cpu()
-                    attn_plot = resize_image_to(attn_plot, input_x.shape[-2:])
-                    attn_list.append(attn_plot)
+        sample_ids = [0]
+        for j in range(num_samples):
+            images = trainer.sample(text_embeds=attr_embeds, batch_size=input_x.shape[0], cond_scale = cond_scale)
+            im_list.append(images.cpu())
 
         if log:
             if len(im_list)>0:
                 utils.log_images(torch.stack(im_list, dim=1).flatten(0,1), wandb,
-                                 name='S_sample_gen_wS', range=(-1,1), nrow=len(sample_ids) * num_samples)
-            if len(q_list)>0:
-                utils.log_images(torch.stack(q_list, dim=1).flatten(0,1), wandb, name='S_q', range=(-1,1), nrow=num_queries)
-                utils.log_images(torch.stack(qx_list, dim=1).flatten(0,1), wandb, name='S_q(X)', range=(-1,1), nrow=num_queries)
+                                 name='Generated Samples with S', range=(-1,1), nrow=(len(sample_ids) * num_samples) + 1)
 
-            if len(attn_list)>0:
-                utils.log_images(torch.stack(attn_list, dim=1).flatten(0,1), wandb, name='Q_attention', range=(0,1), nrow=num_queries)
 
     # Load epoch
     load_epoch = 0
@@ -269,7 +315,8 @@ def main(args):
 
     # Test
     if args.test:
-        sample_with_querier(trainer, sample_ids=[-1], num_samples=5, num_queries=20, query_size=(qh, qw), epoch=load_epoch, log=True, full_queries=False)
+        # sample_with_querier(trainer, sample_ids=[-1], num_samples=5, num_queries=20, query_size=(qh, qw), epoch=load_epoch, log=True, full_queries=False)
+        sample_with_gt(trainer, num_samples=args.num_samples, cond_scale=cond_scale, epoch=load_epoch, log=True)
         exit()
 
     # Train

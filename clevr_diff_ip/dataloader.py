@@ -56,10 +56,10 @@ class Clevr_with_masks(torch.utils.data.Dataset):
 		return image[:3], torch.cat([torch.clamp(mask[:1], 0, 1), image[:3]])
 
 class Clevr_with_attr(torch.utils.data.Dataset):
-	def __init__(self, img_dir, split, attribute='color', transform=None, max_num=None, perc_train=0.8):
+	def __init__(self, img_dir, split, attribute='color', max_attributes=5, transform=None, max_num=None, perc_train=0.8):
 
 		self.attribute = attribute
-		self.max_objects = 5
+		self.max_attributes = max_attributes
 
 		self.img_dir = img_dir
 		self.transform = transform
@@ -113,7 +113,7 @@ class Clevr_with_attr(torch.utils.data.Dataset):
 		s = open(scene_path)
 		scene = json.load(s)
 
-		atts = torch.zeros((self.max_objects,), dtype=torch.int32)
+		atts = torch.zeros((self.max_attributes,), dtype=torch.int32)
 		for i, object in enumerate(scene['objects']):
 			atts[i] = self.attribute_list.index(object[self.attribute]) + 1
 		return image[:3], atts

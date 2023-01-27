@@ -95,6 +95,7 @@ def main(args):
     patch_size = 5
     qh = qw = 128 - patch_size + 1
     C = 3
+    NULL_VAL = -10 # TODO: Check its the same in imagen or give as argument
 
     ## Data
     transform = transforms.Compose([transforms.ToTensor(),  
@@ -145,7 +146,7 @@ def main(args):
     tau_vals = np.linspace(args.tau_start, args.tau_end, args.epochs)
 
 
-    def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, query_size=(128, 128), epoch=0, max_query=100, log=False, full_queries=False):
+    def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, query_size=(128, 128), epoch=0, max_query=100, log=False, null_val=-10, full_queries=False):
 
         q_list = []
         qx_list = []
@@ -155,7 +156,7 @@ def main(args):
         _, (input_x, input_mask) = next(enumerate(testloader))
         input_mask = input_mask[:, :1]
         N, C, W, H = input_mask.shape
-        NULL_VAL = 0 #-10
+        NULL_VAL = null_val
 
 
         if not log:
@@ -267,7 +268,7 @@ def main(args):
 
     # Test
     if args.test:
-        sample_with_querier(trainer, sample_ids=[-1], num_samples=5, num_queries=20, query_size=(qh, qw), epoch=load_epoch, log=True, full_queries=False)
+        sample_with_querier(trainer, sample_ids=[-1], num_samples=5, num_queries=20, query_size=(qh, qw), epoch=load_epoch, log=True, null_val=NULL_VAL, full_queries=False)
         exit()
 
     # Train
@@ -277,7 +278,7 @@ def main(args):
             trainer.imagen.unets[0].querier.tau = tau_vals[epoch]
             if epoch % 1 == 0:
                 sample_ids = []
-                sample_with_querier(trainer, sample_ids=sample_ids, num_queries=20, query_size=(qh, qw), epoch=epoch, log=True)
+                sample_with_querier(trainer, sample_ids=sample_ids, num_queries=20, query_size=(qh, qw), epoch=epoch, null_val=NULL_VAL, log=True)
                 wandb.log({'lr':trainer.get_lr(1)})
         for _ in tqdm(range(iters_per_epoch)):
             dict_out = trainer.train_step(unet_number=1, max_batch_size=100)

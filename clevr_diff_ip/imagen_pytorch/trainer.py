@@ -913,21 +913,19 @@ class ImagenTrainer(nn.Module):
         dict_out = {}
         optimizer.step()
 
-        grads = []
-        # grads.append(utils.get_grad_norm(self.imagen.unets[0]))
+        grads = {}
 
         if np.random.random() < 0.1:
-            if hasattr(self.imagen.unets[0], 'querier'):
-                grads.append(utils.get_grad_norm(self.imagen.unets[0].querier))
-            else:
-                grads.append(0.)
-            optimizer.zero_grad()
+            grads.update({'Unet Grads': utils.get_grad_norm(self.imagen.unets[0])})
 
-            if grads is not None:
-                dict_out.update({
-                    'unet_grads': grads[0],
-                    # 'querier_grads': grads[1]
-                                 })
+            if hasattr(self.imagen.unets[0], 'querier'):
+                grads.update({'Querier Grads': utils.get_grad_norm(self.imagen.unets[0].querier)})
+            if hasattr(self.imagen.unets[0], 'query_encoder'):
+                grads.update({'Query Encoder Grads': utils.get_grad_norm(self.imagen.unets[0].query_encoder)})
+        optimizer.zero_grad()
+
+        dict_out = grads
+
         if self.use_ema:
             ema_unet = self.get_ema_unet(unet_number)
             ema_unet.update()
