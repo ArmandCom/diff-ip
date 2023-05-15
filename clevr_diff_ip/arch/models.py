@@ -861,7 +861,7 @@ class PositionalEncoding(nn.Module):
 
 class PositionalEncoding2D(nn.Module):
 
-    def __init__(self, d_model: int, d_spatial: tuple, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_spatial: tuple, dropout: float = 0.0):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         self.w, self.h = d_spatial
@@ -872,7 +872,12 @@ class PositionalEncoding2D(nn.Module):
         Args:
             x: Tensor, shape [seq_len, batch_size, embedding_dim]
         """
-        x = torch.cat([x, self.pe.repeat_interleave(x.shape[0], dim=0)], dim=1)
+        pe = self.pe.repeat_interleave(x.shape[0], dim=0)
+        if pe.shape[-2] != x.shape[-2]:
+            pe = pe.repeat_interleave(x.shape[-2] // pe.shape[-2], dim=-2)
+        if pe.shape[-1] != x.shape[-1]:
+            pe = pe.repeat_interleave(x.shape[-1] // pe.shape[-1], dim=-1)
+        x = torch.cat([x, pe], dim=1)
         return self.dropout(x)
 
     def positionalencoding2d(self, d_model, height, width):

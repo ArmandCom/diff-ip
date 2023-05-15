@@ -4,14 +4,104 @@ import torch.nn.functional as F
 
 
 
-def random_sampling(max_queries_sample, max_queries_possible, num_samples):
-    num_queries = torch.randint(low=0, high=max_queries_sample, size=(num_samples, ))
+# def random_sampling(max_queries_sample, max_queries_possible, num_samples):
+#     num_queries = torch.randint(low=0, high=max_queries_sample, size=(num_samples, ))
+#     qh = int(np.sqrt(max_queries_possible))
+#     mask = torch.zeros(num_samples, max_queries_possible)
+#     mask_all = mask.reshape(num_samples, qh, qh)
+#     mask = torch.zeros(num_samples, qh//2 * qh//2)
+#     max_queries_possible_ = qh//2 * qh//2
+#
+#     for code_ind, num in enumerate(num_queries):
+#         if num == 0:
+#             continue
+#         random_history = torch.multinomial(torch.ones(max_queries_possible_), num, replacement=False)
+#         mask[code_ind, random_history.flatten()] = 1.0
+#
+#     mask = mask.reshape(num_samples, qh//2, qh//2)
+#
+#     # mask_all[:, qh//4:qh//4+qh//2, qh//4:qh//4+qh//2] = mask
+#
+#     mask_all[:, :qh // 4, :qh // 4] = mask[:, :qh // 4, :qh // 4]
+#     mask_all[:, -qh // 4:, -qh // 4:] = mask[:, -qh // 4:, -qh // 4:]
+#     mask = mask_all.reshape(num_samples, max_queries_possible)
+#     return mask
+
+
+def random_sampling(max_queries_sample, max_queries_possible, num_samples, empty=False, exact=False, return_ids=False):
+    if exact:
+        num_queries = [max_queries_sample]*num_samples
+    else:
+        num_queries = torch.randint(low=0, high=max_queries_sample, size=(num_samples,))
+
     mask = torch.zeros(num_samples, max_queries_possible)
-    
+    if empty: return mask
+
+    # ids = torch.arange(max_queries_possible)
+    histories = []
     for code_ind, num in enumerate(num_queries):
         if num == 0:
             continue
         random_history = torch.multinomial(torch.ones(max_queries_possible), num, replacement=False)
+        mask[code_ind, random_history.flatten()] = 1.0
+        if return_ids:
+            # print(random_history)
+            histories.append(random_history)
+
+    if return_ids:
+        if exact and len(histories) > 0:
+            histories = torch.stack(histories)
+        return histories
+    return mask
+
+def random_sampling_w_prior(max_queries_sample, max_queries_possible, num_samples, empty=False, exact=False, return_ids=False, case='patches', wh = None):
+    if exact:
+        num_queries = [max_queries_sample]*num_samples
+    else:
+        num_queries = torch.randint(low=0, high=max_queries_sample, size=(num_samples,))
+
+    if case.startswith('patches'):
+        probs = torch.ones(max_queries_possible)
+        side = np.sqrt(max_queries_possible)
+        discard = side//2
+        probs = probs.reshape(side, side)
+        probs[:discard, :discard] = 0.1
+        probs[-discard:, -discard:] = 0.1
+        assert probs[probs!=0].sum() >= max_queries_sample
+    if case.startswith('attributes'):
+        # TODO: maybe start at the center (max prob) and lower towards the sides
+        assert isinstance(wh, tuple)
+        probs = torch.ones(max_queries_possible)
+        probs = probs.reshape(wh[0], wh[1]) # attr, obj
+        for i in wh[0]:
+            probs[i] /= 2**i
+        assert probs[probs != 0].sum() >= max_queries_sample
+
+    mask = torch.zeros(num_samples, max_queries_possible)
+    if empty: return mask
+
+    # ids = torch.arange(max_queries_possible)
+    histories = []
+    for code_ind, num in enumerate(num_queries):
+        if num == 0:
+            continue
+        random_history = torch.multinomial(torch.ones(max_queries_possible), num, replacement=False)
+        mask[code_ind, random_history.flatten()] = 1.0
+        if return_ids:
+            # print(random_history)
+            histories.append(random_history)
+
+    if return_ids:
+        if exact and len(histories) > 0:
+            histories = torch.stack(histories)
+        return histories
+    return mask
+
+def random_single_sampling(max_queries_possible, num_samples):
+    mask = torch.zeros(num_samples, max_queries_possible)
+
+    for code_ind in range(num_samples):
+        random_history = torch.multinomial(torch.ones(max_queries_possible), 1, replacement=False)
         mask[code_ind, random_history.flatten()] = 1.0
 
     return mask
@@ -39,7 +129,7 @@ def adaptive_sampling(x, num_queries, querier, patch_size, max_queries):
                     break
             if counter == N:
                 break
-            query_vec = querier(patch_mask, mask)
+            query_vec, query_soft = querier(patch_mask, mask)
             mask[np.arange(N), query_vec.argmax(dim=1)] = 1.0
             patch_mask = update_masked_image(patch_mask, x, query_vec, patch_size)
     return final_mask, final_patch_mask
@@ -77,7 +167,7 @@ def update_masked_image(masked_image, original_image, query_vec, patch_size):
     # convoluting signal with kernel and applying padding
     mask = F.conv2d(query_vec, kernel, stride=1, padding=patch_size - 1, bias=None)
     output = mask * original_image
-    modified_history = (1-mask) * masked_image + output # TODO: Aixo esta malament si es superposen dos patches. Bueno per MNIST no. pero cutre.
+    modified_history = (1 - mask) * masked_image + output # TODO: Aixo esta malament si es superposen dos patches. Bueno per MNIST no. pero cutre.
     # modified_history = torch.clamp(modified_history, min=-1.0, max=1.0)
 
     return modified_history

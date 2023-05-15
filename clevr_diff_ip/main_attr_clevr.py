@@ -15,9 +15,8 @@ import torchvision.transforms as transforms
 # import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader
 
-# from arch.modules import UNet_conditional, UNet_conditional_celeba, UNet_conditional_cifar10, EMA
-# from arch.ddpm_conditional import Diffusion
-# from arch.models import Querier
+from arch.vector_querier_models import answer_queries, answer_single_query
+
 import ops
 import utils
 import wandb
@@ -30,20 +29,20 @@ import torchvision as tv
 import lovely_tensors as lt
 lt.monkey_patch()
 
+# ps -up `nvidia-smi -q -x | grep pid | sed -e 's/<pid>//g' -e 's/<\/pid>//g' -e 's/^[[:space:]]*//'`
 # conda activate imagen; cd projects/clevr_diff_ip/; accelerate launch main_clevr.py --batch_size 16 --sampling biased --test --name querier128SAUnet_S3000biased_and_unbiased_withmask_hard
 
 def parseargs():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=300)
+    parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--data', type=str, default='clevr')
     parser.add_argument('--batch_size', type=int, default=20) # 128
     parser.add_argument('--max_queries', type=int, default=50)
     parser.add_argument('--max_queries_test', type=int, default=15)
     parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--tau_start', type=float, default=1.0)
+    parser.add_argument('--tau_start', type=float, default=5.0)
     parser.add_argument('--tau_end', type=float, default=1.0)
     parser.add_argument('--lambd', type=float, default=0.5)
-    parser.add_argument('--sampling', type=str, default='random')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--name', type=str, default='celeba')
     parser.add_argument('--mode', type=str, default='online')
@@ -59,11 +58,22 @@ def parseargs():
     parser.add_argument('--gpu_id', type=str, default="0")
     parser.add_argument('--load_epoch', type=int, default=0)
     parser.add_argument('--test', type=bool, default=False)
-    parser.add_argument('--cond_scale', type=float, default=1)
+    parser.add_argument('--cond_scale', type=float, default=3)
     parser.add_argument('--attribute', type=str, default="color")
     parser.add_argument('--num_samples', type=int, default=1)
 
+    parser.add_argument('--freeze_unet', type=bool, default=False)
+    parser.add_argument('--train_querier', type=bool, default=True) # Doesn't work?
+    parser.add_argument('--all_queries', type=bool, default=False)
+    parser.add_argument('--sampling', type=str, default='random')
+    parser.add_argument('--max_queries_biased', type=int, default=10)
+    parser.add_argument('--embed_dim', type=int, default=8)
+    parser.add_argument('--experiment_type', type=str, default='patches')
+    parser.add_argument('--null_val', type=float, default=-10)
     args = parser.parse_args()
+
+    args.train_querier = False
+    args.all_queries = False
     if args.num_viz > args.batch_size:
         args.num_viz = args.batch_size
     return args
@@ -72,7 +82,7 @@ def parseargs():
 def main(args):
     ## Setup
     # wandb
-    run = wandb.init(project="Diff-IP-Clevr", name=args.name, mode=args.mode)
+    run = wandb.init(project="Diff-IP-Clevr-attr", name=args.name, mode=args.mode)
     # model_dir = os.path.join(args.save_dir, f'{run.id}')
     # os.makedirs(model_dir, exist_ok=True)
 
@@ -87,6 +97,8 @@ def main(args):
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print('DEVICE:', device)
     print( 'N Dev, Curr Dev', torch.cuda.device_count(), torch.cuda.current_device())
+    print('\n Look at the TODO list! \n')
+
     # random
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -106,7 +118,11 @@ def main(args):
     elif args.attribute == 'shape':
         max_num_attributes = 5
     else: raise NotImplementedError
-    attr_size = 256
+    max_num_queries = max_num_attributes * max_num_objects
+    embed_dim = args.embed_dim
+    attr_size = embed_dim * max_num_queries # Depending on if we use answers or embeddings for conditioning.
+    args.max_queries_biased = 10 # max_num_queries
+
 
     ## Data
     transform = transforms.Compose([transforms.ToTensor(),  
@@ -122,12 +138,11 @@ def main(args):
 
     iters_per_epoch = len(trainset) // args.batch_size
 
-    sampling_mode = 'biased'
 
     unet1 = Unet( # TODO: Increase dim to 128 at the expense of other hyperparams.
-        dim = 32,
+        dim = 64,
         image_size = (W, H),
-        sampling_mode = sampling_mode,
+        sampling_mode = args.sampling,
         max_num_queries = 20,
         max_rand_queries = 100,
         max_num_attributes = max_num_attributes,
@@ -140,7 +155,9 @@ def main(args):
         num_resnet_blocks = 3,
         layer_attns = (False, False, False, True),
         layer_cross_attns = (True, True, True, True), # TODO: Checked all true
-        max_text_len = max_num_attributes
+        max_text_len = max_num_attributes,
+        cond_images_channels = 3, # S + GT Image,
+        FLAGS = args,
     )
     # cond_images_channels = 1 + C # S + GT Image
 
@@ -148,7 +165,7 @@ def main(args):
         unets = (unet1),
         image_sizes = (H),
         timesteps = 1000,
-        text_embed_dim = attr_size, # Not sure if it's necessary, but a bunch of things are done with this
+        text_embed_dim = attr_size,
         cond_drop_prob=0.1
     )
 
@@ -156,129 +173,150 @@ def main(args):
                             warmup_steps = 1 * iters_per_epoch,
                             cosine_decay_max_steps = (args.epochs - 1) * iters_per_epoch,
                             split_valid_from_train = True,
-                            dl_tuple_output_keywords_names = ('images', 'text_embeds')).cuda()
+                            dl_tuple_output_keywords_names = ('images', 'text_embeds', 'cond_images')).cuda()
 
     trainer.add_train_dataset(trainset, batch_size = args.batch_size)
 
-
+    # Freeze network parameters to train querier
+    if args.freeze_unet and args.train_querier:
+        for param_name, param in trainer.imagen.named_parameters():
+            if "querier" not in param_name:
+                param.requires_grad = False
+            print(param.requires_grad)
+        print('Frozen unet')
     tau_vals = np.linspace(args.tau_start, args.tau_end, args.epochs)
 
 
-    # def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, query_size=(128, 128), epoch=0, max_query=100, log=False, full_queries=False):
-    #
-    #     q_list = []
-    #     qx_list = []
-    #     attn_list = []
-    #     im_list = []
-    #
-    #     _, attr_embeds = next(enumerate(testloader))
-    #     N, C, W, H = input_mask.shape
-    #     NULL_VAL = 0 #-10
-    #
-    #
-    #     if not log:
-    #         utils.save_images(input_x, os.path.join(model_dir_ckpt, 'GT_sample.png'), range=(-1,1))
-    #         utils.save_images(input_mask[:, :1] * torch.ones_like(input_x),
-    #                           os.path.join(model_dir_ckpt, 'GT_mask.png'), range=(0,1))
-    #     else:
-    #         pass
-    #
-    #
-    #     if full_queries:
-    #         sample_ids = [0]
-    #         for j in range(num_samples):
-    #             images = trainer.sample(cond_images=torch.cat([input_mask, input_x], dim=1), batch_size=input_mask.shape[0])
-    #             im_list.append(images.cpu())
-    #     else:
-    #         querier = trainer.imagen.unets[0].querier # Put to eval or torch nograd
-    #         if sample_ids == 'all':
-    #             sample_ids = list(np.arange(num_queries))
-    #         elif -1 in sample_ids:
-    #             sample_ids.remove(-1)
-    #             sample_ids.append(num_queries-1)
-    #
-    #         hq, wq = query_size
-    #         input_mask = resize_image_to(input_mask, hq + patch_size - 1)
-    #         masked_x = torch.zeros_like(input_mask) + NULL_VAL
-    #         mask = torch.zeros(N, hq*wq).to(device)
-    #
-    #         for i in range(num_queries):
-    #             # Save queries
-    #             # if i == 0:
-    #             #     plot_mask = ops.random_sampling(max_query, query_size[0]*query_size[1], N).reshape(N, 1, *query_size).clone()
-    #             # else:
-    #             #     plot_mask = mask.reshape(N, 1, *query_size).clone().cpu()
-    #
-    #             plot_mask = masked_x.clone()
-    #
-    #
-    #             plot_mask[plot_mask != NULL_VAL] = 1
-    #             plot_mask[plot_mask == NULL_VAL] = 0
-    #             # plot_mask_raw = plot_mask.clone()
-    #
-    #             plot_queries = resize_image_to(plot_mask * input_mask, input_x.shape[-2:])
-    #             plot_mask = resize_image_to(plot_mask, input_x.shape[-2:])
-    #             gaussian_blur = tv.transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
-    #
-    #             plot_queries = gaussian_blur(plot_queries)
-    #             plot_mask = gaussian_blur(plot_mask) # Gaussian blob
-    #
-    #             plot_queries[plot_queries > 0.02] = 1
-    #             plot_queries[plot_queries <= 0.02] = 0
-    #
-    #             plot_mask[plot_mask > 0.02] = 1
-    #             plot_mask[plot_mask <= 0.02] = 0
-    #
-    #             drawn_queries_x = torch.ones_like(plot_mask) * plot_queries + input_x * (1-plot_queries)
-    #             drawn_queries = torch.ones_like(plot_mask) * plot_mask + input_x * (1-plot_mask)
-    #
-    #             if not log:
-    #                 utils.save_images(drawn_queries, os.path.join(model_dir_ckpt, 'E{}_S{}_queries.png'.format(epoch,i)), range=(-1,1))
-    #             else:
-    #                 q_list.append(drawn_queries)
-    #                 qx_list.append(drawn_queries_x)
-    #
-    #             gt_input = resize_image_to(input_x, hq + patch_size - 1)
-    #             # gt_input = torch.cat([input_mask, resize_image_to(input_x, query_size)], dim=1)
-    #
-    #             # Save images
-    #             if i in sample_ids:
-    #
-    #                 for j in range(num_samples):
-    #                     images = trainer.sample(cond_images=torch.cat([masked_x, gt_input], dim=1), batch_size=input_mask.shape[0])
-    #                     if not log:
-    #                         utils.save_images(torch.ones_like(plot_mask) * plot_mask + images.cpu() * (1-plot_mask),
-    #                                           os.path.join(model_dir_ckpt, 'E{}_S{}_{}_sample_gen_wS.png'.format(epoch,i,j)), range=(-1,1))
-    #                     else:
-    #                         im_list.append(torch.ones_like(plot_mask) * plot_mask + images.cpu() * (1-plot_mask))
-    #
-    #             # Querier update
-    #             querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
-    #             with torch.no_grad():
-    #                 query_vec, attn = querier(querier_inputs, mask, return_attn=True)
-    #             mask[np.arange(N), query_vec.argmax(dim=1)] = 1.0
-    #             masked_x = ops.update_masked_image(masked_x, input_mask, query_vec.cpu(), patch_size=patch_size)
-    #             if log:
-    #                 attn_plot = attn.reshape(N, 1, *query_size).clone().cpu()
-    #                 attn_plot = resize_image_to(attn_plot, input_x.shape[-2:])
-    #                 attn_list.append(attn_plot)
-    #
-    #     if log:
-    #         if len(im_list)>0:
-    #             utils.log_images(torch.stack(im_list, dim=1).flatten(0,1), wandb,
-    #                              name='S_sample_gen_wS', range=(-1,1), nrow=len(sample_ids) * num_samples)
-    #         if len(q_list)>0:
-    #             utils.log_images(torch.stack(q_list, dim=1).flatten(0,1), wandb, name='S_q', range=(-1,1), nrow=num_queries)
-    #             utils.log_images(torch.stack(qx_list, dim=1).flatten(0,1), wandb, name='S_q(X)', range=(-1,1), nrow=num_queries)
-    #
-    #         if len(attn_list)>0:
-    #             utils.log_images(torch.stack(attn_list, dim=1).flatten(0,1), wandb, name='Q_attention', range=(0,1), nrow=num_queries)
+
+    def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, query_size=(128, 128), epoch=0, max_query=100, log=False, full_queries=False):
+
+        q_list = []
+        qx_list = []
+        attn_list = []
+        im_list = []
+
+
+        _, (input_x, attrs, cond_images) = next(enumerate(testloader))
+        N, C, W, H = input_x.shape
+
+        text_table = wandb.Table(columns=["Attribute IDs"])
+        for i in range(N):
+            text_table.add_data(' '.join(str(e) for e in list(attrs[i].numpy())))
+        wandb.log({"Attributes": text_table})
+
+        if not log:
+            utils.save_images(input_x, os.path.join(model_dir_ckpt, 'GT_sample.png'), range=(-1, 1))
+        else:
+            im_list.append(input_x)
+            utils.log_images(input_x, wandb,
+                             name='GT images', range=(-1, 1), nrow=1)
+
+        querier = trainer.imagen.unets[0].querier # Put to eval or torch nograd
+        if sample_ids == 'all':
+            sample_ids = list(np.arange(num_queries))
+        elif -1 in sample_ids:
+            sample_ids.remove(-1)
+            sample_ids.append(num_queries-1)
+
+
+        q_mask = torch.ones((N, max_num_attributes, max_num_objects), device=input_x.device, dtype=attrs.dtype).to(device)
+        q_all = torch.linspace(1, max_num_attributes, max_num_attributes, device=input_x.device, dtype=attrs.dtype)[None, :, None].to(device)
+        q = (q_mask * q_all).reshape(N, -1)
+
+        attr_embeds = trainer.imagen.unets[0].cond_embedding(q)
+        attr_embeds_neg = trainer.imagen.unets[0].cond_embedding_neg(q)
+        attr_embeds_unasked = trainer.imagen.unets[0].cond_embedding(torch.zeros_like(q))
+
+
+        # Select the asked queries in their embeddings according to the answers.
+        ans_neg = torch.zeros_like(q)[..., None]
+        ans_pos = ans_neg.clone()
+        ans_unasked = ans_neg.clone()
+        cond_pos, cond_neg, cond_unasked = (attr_embeds * ans_pos), \
+                             (attr_embeds_neg * ans_neg), (attr_embeds_unasked * ans_unasked)
+
+        q_mask = q_mask * 0
+        gt_attrs_rem = attrs.to(device)
+        input_x = input_x.to(device)
+        queried_attrs = []
+        sampled_im_list = []
+        attn_list = []
+        for i in range(num_queries):
+
+            # Get new query with querier and grads
+            in_embeds = torch.stack([cond_pos, cond_neg, cond_unasked], dim=-1)
+            in_ans = torch.stack([ans_pos, ans_neg, ans_unasked], dim=-1)
+
+            with torch.no_grad():
+                q_new, attn = querier(cond=in_embeds, ans=in_ans,
+                                      image=input_x, mask=q_mask.reshape(N, -1),
+                                      return_attn=True)
+
+            q_mask = torch.clamp(q_mask + q_new.reshape(*q_mask.shape), 0, 1)
+            q_new = q_new.reshape(N, max_num_attributes, max_num_objects)
+
+            # answer new query
+            # ans_new, chosen_attr, gt_attrs_rem  = \
+            #     answer_single_query(q_new.reshape(N, max_num_attributes, max_num_objects),
+            #                         gt_attrs_rem)
+            ans_new, ans_all = \
+                answer_queries(q_new, gt_attrs_rem)
+
+
+            chosen_attr = []
+            # TODO: make sure the +1 makes sense
+            chosen_attr.append(q_new.max(1)[1].sum(1).cpu().numpy() + 1)
+            chosen_attr.append(q_new.max(2)[1].sum(1).cpu().numpy() + 1)
+            chosen_attr.append(ans_new[ans_new != 0].cpu().numpy())
+
+            queried_attrs.append(np.stack(chosen_attr, axis=1))
+
+            # select the asked queries in their embeddings according to the answers.
+            cond_pos = torch.where(ans_new == 1, attr_embeds * q_new.reshape(N, -1, 1), cond_pos)
+            cond_neg = torch.where(ans_new == -1, attr_embeds_neg * q_new.reshape(N, -1, 1), cond_neg)
+            cond_unasked = torch.where(ans_new != 0, torch.zeros_like(cond_unasked), cond_unasked)
+
+            ans_pos = torch.where(ans_new == 1, torch.ones_like(ans_pos), ans_pos)
+            ans_neg = torch.where(ans_new == -1, -torch.ones_like(ans_pos), ans_neg)
+            ans_unasked = torch.where(ans_new != 0, torch.zeros_like(ans_unasked), ans_unasked)
+
+            if i in sample_ids:
+                condition = torch.stack([cond_pos, cond_neg], dim=-1)
+                answers = torch.stack([ans_pos, ans_neg], dim=-1)
+                condition = torch.cat([condition, answers], dim=2)
+                if num_samples > 0:
+                    for j in range(num_samples):
+                        images = trainer.sample(text_embeds=condition, cond_images=cond_images, batch_size=N, cond_scale=cond_scale)
+                        sampled_im_list.append(images.cpu())
+            attn_plot = attn.reshape(N, 1, max_num_attributes, max_num_objects).clone().cpu()
+            attn_list.append(attn_plot)
+
+        # condition = torch.stack([cond_pos, cond_neg], dim=-1)
+
+        try:
+            queried_attrs = np.stack(queried_attrs, axis=1)
+            # Report selected queries
+            text_table = wandb.Table(columns=["Queried Attributes IDs"])
+            for i in range(N):
+                text_table.add_data('_  _'.join(str(int(e[0]))+'|'+
+                                                  str(int(e[1]))+'|'+
+                                                  str(int(e[2]))
+                                                  for e in list(queried_attrs[i])))
+            wandb.log({"Queried Attributes": text_table})
+        except: print('Chosen attributes didn\'t have the same shape.')
+
+        if log:
+            if len(sampled_im_list)>0:
+                utils.log_images(torch.stack(sampled_im_list, dim=1).flatten(0,1), wandb,
+                                 name='S_sample_gen_wS', range=(-1,1), nrow=len(sample_ids) * num_samples)
+            if len(attn_list)>0:
+                utils.log_images(torch.stack(attn_list, dim=1).flatten(0,1), wandb, name='Q_attention', range=(0,1), nrow=num_queries)
 
     def sample_with_gt(trainer, num_samples=1, cond_scale=3., epoch=0, log=True):
 
         im_list = []
 
-        _, (input_x, attr_embeds) = next(enumerate(testloader))
+        _, (input_x, attr_embeds, cond_images) = next(enumerate(testloader))
         N, C, W, H = input_x.shape
 
         text_table = wandb.Table(columns=["Attribute IDs"])
@@ -295,7 +333,7 @@ def main(args):
 
         sample_ids = [0]
         for j in range(num_samples):
-            images = trainer.sample(text_embeds=attr_embeds, batch_size=input_x.shape[0], cond_scale = cond_scale)
+            images = trainer.sample(text_embeds=attr_embeds, cond_images=cond_images, batch_size=input_x.shape[0], cond_scale = cond_scale)
             im_list.append(images.cpu())
 
         if log:
@@ -315,19 +353,28 @@ def main(args):
 
     # Test
     if args.test:
-        # sample_with_querier(trainer, sample_ids=[-1], num_samples=5, num_queries=20, query_size=(qh, qw), epoch=load_epoch, log=True, full_queries=False)
-        sample_with_gt(trainer, num_samples=args.num_samples, cond_scale=cond_scale, epoch=load_epoch, log=True)
+        sample_with_querier(trainer, sample_ids=[-1], num_samples=1, num_queries=10, query_size=(qh, qw), epoch=load_epoch, log=True, full_queries=False)
+        if args.all_queries:
+            # TODO: implement num_samples to be sampled in parallel.
+            sample_with_gt(trainer, num_samples=args.num_samples, cond_scale=cond_scale, epoch=load_epoch, log=True)
         exit()
 
     # Train
+    trainer.imagen.unets[0].args.train_querier = args.train_querier
     trainer.imagen.unets[0].sampling = args.sampling
     for epoch in range(load_epoch, args.epochs, 1):
-        # if hasattr(trainer.imagen.unets[0], 'querier'):
-        #     trainer.imagen.unets[0].querier.tau = tau_vals[epoch]
-        #     if epoch % 1 == 0:
-        #         sample_ids = []
-        #         sample_with_querier(trainer, sample_ids=sample_ids, num_queries=20, query_size=(qh, qw), epoch=epoch, log=True)
-        #         wandb.log({'lr':trainer.get_lr(1)})
+        if hasattr(trainer.imagen.unets[0], 'querier'):
+            trainer.imagen.unets[0].querier.tau = tau_vals[epoch]
+            # if epoch % 1 == 0 and epoch > load_epoch:
+            #     sample_ids = [-1]
+            #     num_samples = 1 #if epoch > 0 else 0
+            #     if epoch % 5 == 0:
+            #         trainer.imagen.unets[0].args.all_queries = True
+            #         sample_with_gt(trainer, num_samples=num_samples, cond_scale=cond_scale, epoch=load_epoch, log=True)
+            #         trainer.imagen.unets[0].args.all_queries = False
+            #     sample_with_querier(trainer, sample_ids=sample_ids, num_queries=10,
+            #                         num_samples=0, query_size=(qh, qw), epoch=epoch, log=True)
+            #     wandb.log({'lr':trainer.get_lr(1)})
         for _ in tqdm(range(iters_per_epoch)):
             dict_out = trainer.train_step(unet_number=1, max_batch_size=100)
             wandb.log(dict_out)

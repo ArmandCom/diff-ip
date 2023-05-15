@@ -29,6 +29,16 @@ from utils import ltplot
 import ops
 # helper functions
 
+# from arch.models import Querier
+# from arch.models import Querier128
+# from arch.models import Querier128_with_mask
+# from arch.models import Querier32
+from arch.modules import SAUNet, Scorer, QuerierImageAttr, QuerierLinearImageAttr, QuerierConvImageAttr, S_AE, S_ConvAE, S_PoolMLP, QuerierFactorizedImageAttr, QuerierAttn
+from arch.vector_querier_models import QueryEncoder, QueryLinearEncoder, answer_queries, answer_single_query
+from arch.cifar10 import QuerierAE
+# from arch.models import Querier128Flat
+
+
 def exists(val):
     return val is not None
 
@@ -199,6 +209,8 @@ class GaussianDiffusionContinuousTimes(nn.Module):
             self.log_snr = beta_linear_log_snr
         elif noise_schedule == "cosine":
             self.log_snr = alpha_cosine_log_snr
+        # elif noise_schedule.startswith("constant"):
+        #     self.log_snr = partial(constant_log_snr(constant=float(noise_schedule.split('-')[-1])))
         else:
             raise ValueError(f'invalid noise schedule {noise_schedule}')
 
@@ -210,6 +222,9 @@ class GaussianDiffusionContinuousTimes(nn.Module):
     def sample_random_times(self, batch_size, *, device):
         return torch.zeros((batch_size,), device = device).float().uniform_(0, 1)
 
+    def sample_constant_times(self, value, batch_size, *, device):
+        return torch.ones((batch_size,), device = device).float() * value
+
     def get_condition(self, times):
         return maybe(self.log_snr)(times)
 
@@ -219,6 +234,7 @@ class GaussianDiffusionContinuousTimes(nn.Module):
         times = torch.stack((times[:, :-1], times[:, 1:]), dim = 0)
         times = times.unbind(dim = -1)
         return times
+
 
     def q_posterior(self, x_start, x_t, t, *, t_next = None):
         t_next = default(t_next, lambda: (t - 1. / self.num_timesteps).clamp(min = 0.))
@@ -508,7 +524,7 @@ class Attention(nn.Module):
         nk, nv = repeat_many(self.null_kv.unbind(dim = -2), 'd -> b 1 d', b = b)
         k = torch.cat((nk, k), dim = -2)
         v = torch.cat((nv, v), dim = -2)
-
+        feat_kv_dim = v.shape[-2]
         # add text conditioning, if present
 
         if exists(context):
@@ -516,7 +532,6 @@ class Attention(nn.Module):
             ck, cv = self.to_context(context).chunk(2, dim = -1)
             k = torch.cat((ck, k), dim = -2)
             v = torch.cat((cv, v), dim = -2)
-
         # cosine sim attention
 
         if self.cosine_sim_attn:
@@ -536,7 +551,7 @@ class Attention(nn.Module):
         max_neg_value = -torch.finfo(sim.dtype).max
 
         if exists(mask):
-            mask = F.pad(mask, (1, 0), value = True)
+            mask = F.pad(mask, (0, feat_kv_dim), value = True)
             mask = rearrange(mask, 'b j -> b 1 1 j')
             sim = sim.masked_fill(~mask, max_neg_value)
 
@@ -696,7 +711,7 @@ class ResnetBlock(nn.Module):
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else Identity()
 
 
-    def forward(self, x, time_emb = None, cond = None):
+    def forward(self, x, time_emb = None, cond = None, cond_mask = None):
 
         scale_shift = None
         if exists(self.time_mlp) and exists(time_emb):
@@ -710,7 +725,7 @@ class ResnetBlock(nn.Module):
             assert exists(cond)
             h = rearrange(h, 'b c h w -> b h w c')
             h, ps = pack([h], 'b * c')
-            h = self.cross_attn(h, context = cond) + h
+            h = self.cross_attn(h, context = cond, mask = cond_mask) + h
             h, = unpack(h, ps, 'b * c')
             h = rearrange(h, 'b h w c -> b c h w')
 
@@ -974,12 +989,12 @@ class TransformerBlock(nn.Module):
                 FeedForward(dim = dim, mult = ff_mult)
             ]))
 
-    def forward(self, x, context = None):
+    def forward(self, x, context = None, mask = None):
         x = rearrange(x, 'b c h w -> b h w c')
         x, ps = pack([x], 'b * c')
 
         for attn, ff in self.layers:
-            x = attn(x, context = context) + x
+            x = attn(x, context = context, mask = mask) + x
             x = ff(x) + x
 
         x, = unpack(x, ps, 'b * c')
@@ -1074,14 +1089,6 @@ class UpsampleCombiner(nn.Module):
         outs = [conv(fmap) for fmap, conv in zip(fmaps, self.fmap_convs)]
         return torch.cat((x, *outs), dim = 1)
 
-# from arch.models import Querier
-# from arch.models import Querier128
-# from arch.models import Querier128_with_mask
-# from arch.models import Querier32
-from arch.modules import SAUNet
-from arch.vector_querier_models import QueryEncoder, QueryLinearEncoder, answer_queries
-
-# from arch.models import Querier128Flat
 
 class Unet(nn.Module):
     def __init__(
@@ -1092,7 +1099,6 @@ class Unet(nn.Module):
         image_size = (128, 128),
         sampling_mode = 'random',
         max_num_queries = 100,
-        max_rand_queries = 100,
         max_num_attributes = 10,
         max_num_objects = 5,
         image_embed_dim = 1024,
@@ -1113,7 +1119,7 @@ class Unet(nn.Module):
         lowres_cond = False,                # for cascading diffusion - https://cascaded-diffusion.github.io/
         layer_attns = True,
         layer_attns_depth = 1,
-        layer_mid_attns_depth = 1,
+        layer_mid_attns_depth = 1, # Note: last change
         layer_attns_add_text_cond = True,   # whether to condition the self-attention blocks with the text embeddings, as described in Appendix D.3.1
         attend_at_middle = True,            # whether to have a layer of attention at the bottleneck (can turn off for higher resolution in cascading DDPM, before bringing in efficient attention)
         layer_cross_attns = True,
@@ -1140,15 +1146,17 @@ class Unet(nn.Module):
         cosine_sim_attn = False,
         self_cond = False,
         combine_upsample_fmaps = False,      # combine feature maps from all upsample blocks, used in unet squared successfully
-        pixel_shuffle_upsample = True        # may address checkboard artifacts
+        pixel_shuffle_upsample = True,        # may address checkboard artifacts
+        FLAGS = None,
     ):
         super().__init__()
+
+        self.args = FLAGS
 
         self.image_size = image_size
         self.patch_size = patch_size
         self.sampling = sampling_mode
-        self.max_rand_queries = max_rand_queries
-        self.null_val = -10
+        self.null_val = self.args.null_val
 
         # guide researchers
         assert attn_heads > 1, 'you need to have more than 1 attention head, ideally at least 4 or 8'
@@ -1179,37 +1187,100 @@ class Unet(nn.Module):
         self.has_cond_image = cond_images_channels > 0
         self.cond_images_channels = cond_images_channels
 
-        self.size_cond = 128
-        self.all_queries = False
 
         self.max_num_queries = max_num_queries
-        self.max_rand_queries = max_rand_queries
         self.max_num_attributes = max_num_attributes
         self.max_num_objects = max_num_objects
 
+        self.query_decoder = True if self.args.query_mode == 'encoder-decoder' else False
+        self.object_encoding = True
+        self.attention_querier = True
+        add_object_embedding = True if self.args.experiment_type == 'attributes' else False
+        latent_dim = 64 if self.args.experiment_type == 'attributes' else 64
+
+        self.encode_clean_features, self.encode_query_features = False, self.args.encode_query_features
+
         if cond_dim is not None:
-            embed_dim = cond_dim
-            self.cond_embedding = nn.Embedding(self.max_num_attributes + 1, embed_dim, padding_idx=0) # , max_norm=True #TODO: review the in_channels
-            self.cond_embedding_neg = nn.Embedding(self.max_num_attributes + 1, embed_dim, padding_idx=0) # , max_norm=True #TODO: review the in_channels
 
-            # self.query_encoder = QueryEncoder(query_dim=cond_dim, num_layers=4, num_heads=4)
-            # self.query_encoder = QueryLinearEncoder(in_dim = cond_dim * self.max_num_objects, out_dim = cond_dim)
-            self.query_encoder = QueryLinearEncoder(attr_dim=self.max_num_attributes, n_obj=self.max_num_objects, out_dim=cond_dim, embed_dim=embed_dim,
-                                                    # reduce='linear_per_attr', add_answer='keep_pos'
-                                                    # reduce = 'pos_neg_max_max_pooling', add_answer = 'pos_neg'
-                                                    reduce = 'pos_neg_sum_max_pooling', add_answer = 'pos_neg'
-                                                    # reduce = 'pos_sum_pooling', add_answer = 'linear_merge' #None
-                                                    )
+            embed_dim = self.args.embed_dim #cond_dim
+            self.cond_embedding = nn.Embedding(self.max_num_attributes + 1, embed_dim) #, padding_idx=0
+            self.cond_embedding_neg = nn.Embedding(self.max_num_attributes + 1, embed_dim) # , padding_idx=0 , max_norm=True #TODO: review the in_channels
+            # if self.object_encoding:
+            self.cond_embedding_obj = nn.Embedding(self.max_num_objects, embed_dim) # , padding_idx=0 , max_norm=True #TODO: review the in_channels
 
-        if self.has_cond_image:
-            if not self.all_queries:
-                # self.querier = Querier32(query_size=(32, 32), in_channels=cond_images_channels)
-                # self.querier = Querier128(query_size=(128, 128), i n_channels=cond_images_channels)
-                # self.querier = Querier128_with_mask(query_size=(128, 128), in_channels=cond_images_channels)
-                # self.querier = Querier(tau=1.0, num_queries=100, query_dim=64, in_channels=1, num_layers=6, num_heads=8, dropout=0.0)
-                # self.querier = QuerierUnet(dim = 32,image_embed_dim = 256,dim_mults = (1, 2, 4),num_resnet_blocks = 3,layer_attns = (False, False, True),channels = 1 + 3, channels_out = 1,) # Mask + GT Image
-                self.querier = SAUNet(c_in=cond_images_channels, c_out=1, size=self.size_cond, patch_size=self.patch_size)
-            init_channels += 1 # cond_images_channels
+            q_dim = cond_dim
+            if self.args.query_mode == 'flatten':
+                q_dim = self.max_num_objects * self.max_num_attributes * embed_dim
+            elif self.args.query_mode == 'flatten_obj':
+                q_dim = self.max_num_objects * embed_dim
+            elif self.args.query_mode == 'single_queries':
+                q_dim = embed_dim * 2
+
+            if self.query_decoder:
+                use_answers = True
+                self.query_encoder = S_PoolMLP(embed_dim=embed_dim,
+                                               latent_dim=cond_dim,
+                                               hidden_dim=128,
+                                               num_obj=self.max_num_objects,
+                                               num_attr=self.max_num_attributes,
+                                               embeds = (self.cond_embedding, self.cond_embedding_neg, self.cond_embedding_obj),
+                                               use_answers=True)
+                self.loss_rec = nn.MSELoss(reduce=False)
+            else:
+                use_answers = False
+                self.query_encoder = QueryEncoder(attr_dim=self.max_num_attributes, n_obj=self.max_num_objects, out_dim=cond_dim, embed_dim=embed_dim,
+                                                        reduce=self.args.query_mode,
+                                                        use_answers=use_answers,
+                                                        )
+
+            self.encode_clean_features, self.encode_query_features = False, True
+            if self.attention_querier:
+                self.querier = QuerierLinearImageAttr(embed_dim=embed_dim, latent_dim=latent_dim, num_obj=self.max_num_objects,
+                                           num_attr=self.max_num_attributes, hidden_dim=latent_dim*2, encode_image=self.args.include_gt, #False,
+                                                      use_image_features = self.encode_clean_features,
+                                                      use_query_features = self.encode_query_features,
+                                                      add_object_embedding=add_object_embedding, use_latent=False,
+                                                      cond_dim=cond_dim,
+                                                      use_answers=False)
+
+                # self.querier = QuerierAttn(embed_dim=embed_dim, latent_dim=latent_dim,
+                #                                       num_obj=self.max_num_objects,
+                #                                       num_attr=self.max_num_attributes, hidden_dim=latent_dim * 2,
+                #                                       encode_image=True,  # False,
+                #                                       add_object_embedding=add_object_embedding,
+                #                                       use_latent=False,
+                #                                       use_answers=True)
+            else:
+                self.querier = QuerierLinearImageAttr(embed_dim=embed_dim, latent_dim=latent_dim, num_obj=self.max_num_objects,
+                                           num_attr=self.max_num_attributes, hidden_dim=latent_dim*2, encode_image=self.args.include_gt, #False,
+                                                      use_image_features = self.encode_clean_features,
+                                                      use_query_features = self.encode_query_features,
+                                                      add_object_embedding=add_object_embedding, use_latent=False,
+                                                      cond_dim=cond_dim,
+                                                      use_answers=False)
+
+                # self.querier = QuerierFactorizedImageAttr(embed_dim=embed_dim, latent_dim=latent_dim, num_obj=self.max_num_objects,
+                #                            num_attr=self.max_num_attributes, hidden_dim=latent_dim*2, encode_image=False,
+                #                                       add_object_embedding=add_object_embedding, use_latent=False,
+                #                                       use_answers=False)
+
+
+        if self.has_cond_image and cond_dim is None:
+            self.include_gt = self.args.include_gt
+            if self.include_gt:
+                input_chans = init_channels + cond_images_channels
+            else: input_chans = cond_images_channels
+            self.cond_img_size = image_size[0]
+
+            # self.querier = SAUNet(c_in=input_chans,
+            #                       c_out=1, size=self.cond_img_size, patch_size=self.patch_size, multi_resolution=False)
+
+            self.querier = QuerierAE(c_in=input_chans,
+                                  c_out=1, size=self.cond_img_size, patch_size=self.patch_size)
+
+            # self.querier = Scorer(c_in=input_chans,
+            #                       c_out=1, size=self.cond_img_size, patch_size=self.patch_size)
+            init_channels += cond_images_channels # Previously 1 for mask only
 
         # initial convolution
         self.init_conv = CrossEmbedLayer(init_channels, dim_out = init_dim, kernel_sizes = init_cross_embed_kernel_sizes, stride = 1) if init_cross_embed else nn.Conv2d(init_channels, init_dim, init_conv_kernel_size, padding = init_conv_kernel_size // 2)
@@ -1219,7 +1290,7 @@ class Unet(nn.Module):
 
         # time conditioning
 
-        cond_dim = default(cond_dim, dim)
+        cond_dim = default(cond_dim, dim) # TODO: I removed this. Because I dont understand it and it bugs me.
         time_cond_dim = dim * 4 * (2 if lowres_cond else 1)
 
         # embedding time for log(snr) noise from continuous version
@@ -1302,13 +1373,26 @@ class Unet(nn.Module):
         self.to_text_non_attn_cond = None
 
         if cond_on_text:
+            print('removed initial layer norm')
+            # exit()
+            # To sample from last trained model add LayerNorm and remove process_tokens layer
             self.to_text_non_attn_cond = nn.Sequential(
-                nn.LayerNorm(cond_dim),
-                nn.Linear(cond_dim, time_cond_dim),
+                # nn.LayerNorm(q_dim),
+                nn.Linear(q_dim, time_cond_dim),
                 nn.SiLU(),
-                nn.Linear(time_cond_dim, time_cond_dim)
+                nn.Linear(time_cond_dim, time_cond_dim),
+                # nn.SiLU(),
+                # nn.Linear(time_cond_dim, time_cond_dim),
             )
-
+            self.process_tokens = nn.Sequential(
+                # nn.Identity(),
+                nn.Linear(q_dim, cond_dim),
+                nn.SiLU(),
+                nn.Linear(cond_dim, cond_dim),
+                nn.SiLU(),
+                nn.Linear(cond_dim, cond_dim)
+            )
+        self.cond_dim = cond_dim
         # attention related params
 
         attn_kwargs = dict(heads = attn_heads, dim_head = attn_dim_head, cosine_sim_attn = cosine_sim_attn)
@@ -1402,7 +1486,7 @@ class Unet(nn.Module):
         mid_dim = dims[-1]
 
         self.mid_block1 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
-        self.mid_attn = TransformerBlock(mid_dim, depth = layer_mid_attns_depth, **attn_kwargs) if attend_at_middle else None
+        self.mid_attn = TransformerBlock(mid_dim, depth = layer_mid_attns_depth, **attn_kwargs) if attend_at_middle else None # , context_dim = cond_dim # Note: last change
         self.mid_block2 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
 
         # upsample klass
@@ -1536,20 +1620,23 @@ class Unet(nn.Module):
         cond_scale = 1.,
         **kwargs
     ):
-        logits = self.forward(*args, **kwargs)
+        logits, _, _ = self.forward(*args, **kwargs)
 
         if cond_scale == 1:
             return logits
 
-        null_logits = self.forward(*args, cond_drop_prob = 1., **kwargs)
+        null_logits, _, _ = self.forward(*args, cond_drop_prob = 1., **kwargs)
         return null_logits + (logits - null_logits) * cond_scale
 
     def biased_sampling(self, gt_input, cond_masks, num_queries, masked_x, mask, patch_size=1):
         N, device = gt_input.shape[0], gt_input.device
 
         for _ in range(num_queries):
-            querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
-            query_vec = self.querier(querier_inputs, mask)
+            if self.include_gt:
+                querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device) # TODO: if including_gt
+            else:
+                querier_inputs = masked_x.to(device)
+            query_vec, _ = self.querier(querier_inputs, mask)
             mask[torch.arange(N), query_vec.argmax(dim=1)] = 1.0
             masked_x = ops.update_masked_image(masked_x, cond_masks, query_vec, patch_size=patch_size)
 
@@ -1567,10 +1654,12 @@ class Unet(nn.Module):
         cond_images = None,
         self_cond = None,
         # attr_embeds = None, # Note: Added attributes
-        cond_drop_prob = 0.
+        cond_drop_prob = 0.,
+        x_start = None
     ):
         batch_size, device = x.shape[0], x.device
-
+        aux_losses = {}
+        aux_outputs = {}
         # condition on self
         # print(x)
         if self.self_cond:
@@ -1589,72 +1678,175 @@ class Unet(nn.Module):
 
         assert not (self.has_cond_image ^ exists(cond_images)), 'you either requested to condition on an image on the unet, but the conditioning image is not supplied, or vice versa'
 
-        if exists(cond_images):
-            size_cond = self.size_cond #x.shape[-1]
-            assert cond_images.shape[1] == self.cond_images_channels, 'the number of channels on the conditioning image you are passing in does not match what you specified on initialiation of the unet'
-            cond_images = resize_image_to(cond_images, size_cond)
-            cond_masks, cond_rgb = cond_images[:, :1], cond_images[:, 1:] # We use only the mask to condition the diffusion process
 
-            # N = cond_images.shape[0]
-            # PATCH_SIZE = 1
-            # QUERY_ALL = cond_images.shape[-1] ** 2
-            # MAX_QUERIES = 3000
-
+        query_soft = None
+        if exists(cond_images) and not exists(text_embeds):
             N = cond_images.shape[0]
             PATCH_SIZE = self.patch_size
             QUERY_ALL = (self.image_size[0] - PATCH_SIZE + 1) ** 2
-            MAX_RAND_QUERIES = self.max_rand_queries
+            MAX_RAND_QUERIES = self.args.max_queries_random
             NULL_VAL = self.null_val
+            if self.cond_images_channels == 1:
 
-            # initial random sampling
-            if self.training and not self.all_queries:
-                rand, th, init_zeros = random(), 0.1, False
-                # gt_input = cond_images
-                gt_input = cond_rgb
-                if self.sampling == 'biased' and rand > th:
-                    max_queries_biased = 2
-                    num_queries = torch.randint(low=0, high=max_queries_biased, size=(1,))
-                    # # mask, masked_x = ops.adaptive_sampling(x, num_queries, self.querier, PATCH_SIZE, QUERY_ALL)
-                    if init_zeros:
-                        masked_x = torch.zeros_like(cond_masks) + NULL_VAL
-                        mask = torch.zeros(N, QUERY_ALL).to(cond_images.device)
-                    else:
-                        mask = ops.random_sampling(MAX_RAND_QUERIES, QUERY_ALL, x.size(0)).to(device)
-                        masked_x, _, _, _ = ops.get_patch_mask(mask, cond_masks, patch_size=PATCH_SIZE, null_val=NULL_VAL)
-                    with torch.no_grad():
-                        masked_x, mask = self.biased_sampling(gt_input, cond_masks, num_queries, masked_x, mask, patch_size=PATCH_SIZE)
+                # assert cond_images.shape[1] == self.cond_images_channels, 'the number of channels on the conditioning image you are passing in does not match what you specified on initialiation of the unet'
+                cond_images = resize_image_to(cond_images, self.cond_img_size)
 
-                    # two backwards
-                    # masked_x, mask = self.biased_sampling(gt_input, cond_masks, 1, masked_x, mask, patch_size=PATCH_SIZE)
-                elif self.sampling == 'random' or rand <= th:
-                    mask = ops.random_sampling(MAX_RAND_QUERIES, QUERY_ALL, x.size(0)).to(device)
-                    masked_x, S_v, S_ij, split = ops.get_patch_mask(mask, cond_masks, patch_size=PATCH_SIZE, null_val=NULL_VAL)
-                querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
-                query_vec = self.querier(querier_inputs.contiguous(), mask.contiguous())
-                masked_x = ops.update_masked_image(masked_x, cond_masks, query_vec, patch_size=PATCH_SIZE)
-            else:
-                masked_x = cond_masks
+                cond_masks, cond_rgb = cond_images[:, :1], cond_images[:, 1:] # We use only the mask to condition the diffusion process
 
-            masked_x = resize_image_to(masked_x, x.shape[-1])
+                # initial random sampling
+                if self.args.train_querier and not self.args.all_queries:
+                    rand, th, init_zeros = random(), 0.2, True
+                    # gt_input = cond_images
+                    gt_input = cond_images
+                    gt_input = cond_rgb if self.channels == 3 else cond_masks
+                    if self.sampling == 'biased' and rand > th:
+                        num_queries = torch.randint(low=0, high=self.args.max_queries_biased, size=(1,))
+                        # # mask, masked_x = ops.adaptive_sampling(x, num_queries, self.querier, PATCH_SIZE, QUERY_ALL)
+                        if init_zeros:
+                            masked_x = torch.zeros_like(cond_masks) + NULL_VAL
+                            mask = torch.zeros(N, QUERY_ALL).to(cond_images.device)
+                        else:
+                            mask = ops.random_sampling(MAX_RAND_QUERIES, QUERY_ALL, x.size(0)).to(device)
+                            masked_x, _, _, _ = ops.get_patch_mask(mask, cond_masks, patch_size=PATCH_SIZE, null_val=NULL_VAL)
+                        #
+                        # num_queries = torch.randint(low=0, high=self.args.max_queries_biased, size=(masked_x.shape[0],))
+                        # if self.include_gt:
+                        #     querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
+                        # else:
+                        #     querier_inputs = masked_x
+                        # mask, masked_x = ops.adaptive_sampling(querier_inputs, num_queries, self.querier,
+                        #                                        patch_size=self.patch_size,
+                        #                                        max_queries=self.args.max_queries_biased)
+                        with torch.no_grad():
+                            masked_x, mask = self.biased_sampling(gt_input, cond_masks, num_queries, masked_x, mask, patch_size=PATCH_SIZE)
+
+                        # two backwards
+                        # masked_x, mask = self.biased_sampling(gt_input, cond_masks, 1, masked_x, mask, patch_size=PATCH_SIZE)
+                    elif self.sampling == 'random' or rand <= th:
+                        empty = random() < 0.01
+                        mask = ops.random_sampling(MAX_RAND_QUERIES, QUERY_ALL, x.size(0), empty=empty).to(device)
+                        masked_x, S_v, S_ij, split = ops.get_patch_mask(mask, cond_masks, patch_size=PATCH_SIZE, null_val=NULL_VAL)
+
+                    if self.include_gt:
+                        querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
+                    else: querier_inputs = masked_x
+                    query_vec, query_soft = self.querier(querier_inputs.contiguous(), mask.contiguous())
+                    # # NOTE I JUST SELECTED PATCH WITH QUERY_SOFT
+                    # query_vec = query_soft
+                    masked_x = ops.update_masked_image(masked_x, cond_masks, query_vec, patch_size=PATCH_SIZE)
+                else:
+                    masked_x = cond_masks
+                aux_outputs['masked_x'] = masked_x
+                # masked_x = resize_image_to(masked_x, x.shape[-1])
+
+            elif self.cond_images_channels == 3:
+                # TODO:
+                #  write sampling code,
+                #  implement zeroing out of the image with drop prob.
+                #  Check out for overfitting with patches new implementation.
+                assert cond_images.shape[
+                           1] == self.cond_images_channels, 'the number of channels on the conditioning image you are passing in does not match what you specified on initialiation of the unet'
+                cond_images = resize_image_to(cond_images, self.cond_img_size)
+                cond_rgb = cond_images  # We use only the mask to condition the diffusion process
+
+                N = cond_images.shape[0]
+                num_queries = (self.image_size[0] - self.patch_size + 1) ** 2
+
+                # initial random sampling
+                if self.args.train_querier and not self.args.all_queries:
+                    rand, th, init_zeros = random(), 0.1, True
+                    # gt_input = cond_images
+                    gt_input = cond_rgb
+                    if self.sampling == 'biased' and rand > th:
+                        max_queries_biased = self.args.max_queries_biased
+                        num_queries = torch.randint(low=0, high=max_queries_biased, size=(1,))
+                        # # mask, masked_x = ops.adaptive_sampling(x, num_queries, self.querier, PATCH_SIZE, QUERY_ALL)
+                        if init_zeros:
+                            masked_x = torch.zeros_like(cond_rgb) + NULL_VAL
+                            mask = torch.zeros(N, QUERY_ALL).to(cond_images.device)
+                        else:
+                            mask = ops.random_sampling(MAX_RAND_QUERIES, QUERY_ALL, x.size(0)).to(device)
+                            masked_x, _, _, _ = ops.get_patch_mask(mask, cond_rgb, patch_size=PATCH_SIZE, null_val=NULL_VAL)
+                        # num_queries = torch.randint(low=0, high=self.args.max_queries_biased, size=(masked_x.shape[0],))
+                        # if self.include_gt:
+                        #     querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
+                        # else:
+                        #     querier_inputs = masked_x
+                        # mask, masked_x = ops.adaptive_sampling(querier_inputs, num_queries, self.querier, patch_size=self.patch_size, max_queries=self.args.max_queries_biased)
+
+                        with torch.no_grad():
+                            masked_x, mask = self.biased_sampling(gt_input, cond_rgb, num_queries, masked_x, mask,
+                                                                  patch_size=self.patch_size)
+
+                    elif self.sampling == 'random' or rand <= th:
+                        empty = random() < 0.01
+                        mask = ops.random_sampling(self.args.max_queries_random, num_queries, x.size(0), empty).to(device)
+                        masked_x, S_v, S_ij, split = ops.get_patch_mask(mask, cond_rgb, patch_size=self.patch_size,
+                                                                        null_val=self.null_val)
+                    if self.include_gt:
+                        querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
+                    else: querier_inputs = masked_x.to(device)
+                    query_vec, query_soft = self.querier(querier_inputs.contiguous(), mask.contiguous())
+                    masked_x = ops.update_masked_image(masked_x, cond_rgb, query_vec, patch_size=self.patch_size)
+                else:
+                    masked_x = cond_rgb # If training is false, this will be directly the masked_x
+
+                masked_x = resize_image_to(masked_x, x.shape[-1])
             x = torch.cat((masked_x, x), dim=1)
 
+            # # ORTH LOSS - Cross Entropy
+            # if exists(query_soft):
+            #     loss_orth = loss_orth_fn(query_soft)
+            #     alpha = 1e-3
+            #     aux_losses = {'loss_orth': (alpha, loss_orth)}
+
         # initial convolution
+        # self.encode_clean_features = False
+        if self.encode_clean_features and x_start is not None:
+            x = torch.cat([x, x_start], dim=0) # use clean data too to guide querier
+            time = torch.cat([time, torch.zeros_like(time)], dim=0)
 
-        x = self.init_conv(x)
-
+        x = self.init_conv(x) # [16, 32, 128, 128]
         # init conv residual
 
         if self.init_conv_to_final_conv_residual:
-            init_conv_residual = x.clone()
+            init_conv_residual = x.clone() # doesnt get here
 
         # time conditioning
-
-        time_hiddens = self.to_time_hiddens(time)
+        time_hiddens = self.to_time_hiddens(time) # TODO: for cond take last time
 
         # derive time tokens
-
         time_tokens = self.to_time_tokens(time_hiddens)
         t = self.to_time_cond(time_hiddens)
+
+
+        # Pretrained Feature extractor block
+        out_clean_features = None
+        if self.encode_clean_features and x_start is not None:
+            with torch.no_grad():
+                c_= torch.zeros(batch_size, 1, self.cond_dim).to(device)
+                c_mask_ = c_[..., 0] != 0
+                x, x_ = torch.chunk(x, 2, dim=0)
+                t, t_ = torch.chunk(t, 2, dim=0)
+                if exists(self.init_resnet_block):
+                    x_ = self.init_resnet_block(x_, t_) # Not in here
+                # go through the layers of the unet, down and up
+                hiddens = []
+                for pre_downsample, init_block, resnet_blocks, attn_block, post_downsample in self.downs[:-1]:
+
+                    if exists(pre_downsample):
+                        x_ = pre_downsample(x_)
+                    x_ = init_block(x_, t_, c_, c_mask_)
+                    for resnet_block in resnet_blocks:
+                        x_ = resnet_block(x_, t_)
+                        # hiddens.append(x_)
+
+                    x_ = attn_block(x_, c_, c_mask_)
+                    # hiddens.append(x_)
+                    if exists(post_downsample):
+                        x_ = post_downsample(x_)
+                out_clean_features = x_ # 256, 16, 16
+
 
         # add lowres time conditioning to time hiddens
         # and add lowres time tokens along sequence dimension for attention
@@ -1667,179 +1859,351 @@ class Unet(nn.Module):
             t = t + lowres_t
             time_tokens = torch.cat((time_tokens, lowres_time_tokens), dim = -2)
 
+        text_tokens = None
+        c_mask = None
+
         # Note: Attribute embeddings
         if exists(text_embeds):
-
-            attrs = text_embeds
-            # attrs_2 = attrs.clone()
-
-            # Note: This is my own implementation of inconditionality --> All zeros, no colors. Commented the original implementation.
-            #  NOT CORRECT? WOULD INTERPRET 0s DIFFERENTLY. anyways maxpool would keep only zero tokens, so it could potentially work.
-            # attr_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device = device)
-            # attr_keep_mask = rearrange(attr_keep_mask, 'b -> b 1')
-            # null_attr_embed = self.null_attr_embed.to(attrs.dtype)
-            # attrs = torch.where(
-            #     attr_keep_mask,
-            #     attrs,
-            #     null_attr_embed
-            # )
-
-
-            # Option 1: All possible queries
-            max_prob = 1
-            all = np.random.uniform(0, 1)
-            if all < 0.5:
-                prob_ask = np.random.uniform(0, max_prob)
+            histories = None
+            cond_att, ans_att = None, None
+            # cond_images = cond_images
+            if len(text_embeds.shape) == 4:
+                sampling = True
+                cond_pos, cond_neg = text_embeds[..., :-1, 0], text_embeds[..., :-1, 1]
+                ans_pos, ans_neg = text_embeds[..., -1:, 0], text_embeds[..., -1:, 1]
+                if text_embeds.shape[-1] == 3:
+                    cond_unasked, ans_unasked = text_embeds[..., :-1, 2], text_embeds[..., -1:, 2]
+                cond_att, ans_att = None, None
             else:
-                prob_ask = max_prob
-            # prob_ask = 1 # Select for test.
+                sampling = False
+                attrs = text_embeds
 
-            # ops.random_sampling()
-            q_mask = torch.ones((batch_size, self.max_num_attributes, self.max_num_objects), device=text_embeds.device, dtype=attrs.dtype)
-            q_mask_bool = prob_mask_like((batch_size, self.max_num_attributes, self.max_num_objects), prob_ask, device=device)
-            q_mask = q_mask * q_mask_bool
-            q_all = torch.linspace(1, self.max_num_attributes, self.max_num_attributes, device=text_embeds.device, dtype=attrs.dtype)[None, :, None]
-            q = (q_mask * q_all).reshape(batch_size, -1)
-            q_pos, ans = answer_queries(q_mask.clone(), attrs.clone()) #q: [q x num_attr x max_obj], binary - gt_attrs: [b x max_obj]
+                max_prob = 0.99
+                if self.args.all_queries or (not self.args.train_querier and np.random.random() > 1-0.01): # All queries in 10% of the cases
+                    prob_ask = 1 # Select for test.
+                    exact = True
+                    # print('a', prob_ask)
+                else:
+                    prob_ask = np.random.uniform(0, max_prob)
+                    exact = False
+                    # print('b', prob_ask)
+                # prob_ask = 1 # Select for test.
+                q_mask = torch.ones((batch_size, self.max_num_attributes, self.max_num_objects),
+                                    device=text_embeds.device, dtype=attrs.dtype)
+                q_mask_bool = prob_mask_like((batch_size, self.max_num_attributes, self.max_num_objects), prob_ask,
+                                             device=device)
+                q_mask = q_mask * q_mask_bool
+                q_all = torch.linspace(1, self.max_num_attributes, self.max_num_attributes, device=text_embeds.device,
+                                       dtype=attrs.dtype)[None, :, None]
+                q = (q_mask * q_all).reshape(batch_size, -1)
 
-            # qpos_keep_mask = prob_mask_like(q_pos.shape, 1, device=device)  # - 0.3
-            # q_pos = torch.where(
-            #     qpos_keep_mask,
-            #     q_pos,
-            #     torch.zeros_like(q_pos)
+                # Get embeddings for all queries
+                attr_embeds = self.cond_embedding(q)
+                attr_embeds_neg = self.cond_embedding_neg(q)
+                zero_embed = self.cond_embedding(torch.zeros_like(q))
+                obj_embed = self.query_encoder.object_embedding(batch_size, device)
+
+
+                if self.args.experiment_type == 'attributes':
+                    ans_all = answer_queries(q_mask.clone(), # Note: Q is not really used
+                                             attrs.clone())  # q: [q x num_attr x max_obj], binary - gt_attrs: [b x max_obj]
+                else:
+                    ans_all = attrs
+
+                ans = ans_all * q_mask.reshape(*ans_all.shape)
+                # Select the asked queries in their embeddings according to the answers.
+                ans_neg = torch.zeros_like(ans)
+                ans_pos = torch.zeros_like(ans)
+                ans_unasked = torch.zeros_like(ans)
+
+                ans_neg[ans == -1] = 1
+                ans_pos[ans == 1] = 1
+                ans_unasked[ans == 0] = 1
+
+                cond_pos_all, cond_neg_all, cond_unasked_all = (attr_embeds), \
+                    (attr_embeds_neg ), (zero_embed )
+                cond_pos_all_o, cond_neg_all_o = [torch.cat([c, obj_embed], dim=-1) * m for c, m in
+                                                                zip((cond_pos_all, cond_neg_all),
+                                                                    (1, 1) # Identity
+                                                                    # (ans_pos, ans_neg)
+                                                                    )]
+
+                rand, th = random(), 0.2
+                if self.args.all_queries:
+                    cond_pos, cond_neg, cond_unasked = cond_pos_all * ans_pos, cond_neg_all * ans_neg, cond_unasked_all * ans_unasked
+
+                elif self.sampling == 'random' or rand < th: #Random 20% of the times
+
+                    # Randomly sample queries with probability prob_ask: [either 1 or [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+                    # q_mask_bool = prob_mask_like((batch_size, self.max_num_attributes, self.max_num_objects), prob_ask, device=device)
+                    # q_mask = q_mask * q_mask_bool
+
+                    empty = random() < 0.1
+                    q_mask = ops.random_sampling(self.max_num_attributes, self.args.max_queries_random, batch_size, exact=exact, empty=empty).to(device)\
+                        .reshape(batch_size, self.max_num_attributes, self.max_num_objects)
+
+                    # q_mask maps all non asked questions
+                    cond_pos, cond_neg = [c * q_mask.reshape(*ans_all.shape) * a for c, a in
+                                                        zip((cond_pos_all, cond_neg_all),
+                                                            (ans_pos, ans_neg))]
+
+                elif self.sampling == 'biased':
+
+                    # Randomly sample queries with probability prob_ask: [either 1 or [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+                    q_mask_bool = 0
+                    q_mask = q_mask * q_mask_bool
+
+                    # Select the asked queries in their embeddings according to the answers.
+                    ans_neg = torch.zeros_like(q)[..., None]
+                    ans_pos = ans_neg.clone()
+                    ans_unasked = ans_neg.clone()
+
+                    cond_pos, cond_neg, cond_unasked = (attr_embeds * ans_pos), \
+                        (attr_embeds_neg * ans_neg), (zero_embed * ans_unasked)
+
+                    num_steps = np.random.randint(1, self.args.max_queries_biased)
+                    for step in range(num_steps):
+                        in_embeds = torch.stack([cond_pos, cond_neg], dim=-1) # , cond_unasked
+                        in_embeds_all = torch.stack([cond_pos_all_o, cond_neg_all_o], dim=-1) # , cond_unasked
+                        in_ans = torch.stack([ans_pos, ans_neg], dim=-1) #, ans_unasked
+
+                        with torch.no_grad():
+
+                            out_query_features = None
+                            if self.encode_query_features:
+                                attr_embeds_ = self.query_encoder(cond=(cond_pos, cond_neg),
+                                                                  ans=(ans_pos, ans_neg),
+                                                                  cond_att=cond_att,
+                                                                  ans_att=ans_att)
+                                # attr_tokens_ = self.to_text_non_attn_cond(attr_embeds_)
+                                out_query_features = self.process_tokens(attr_embeds_)
+
+                            q_new, q_soft, attn = self.querier(cond=in_embeds, ans=in_ans, image=cond_images, image_features=out_clean_features,
+                                                       query_features=out_query_features, mask=q_mask.reshape(batch_size, -1), cond_all=in_embeds_all,
+                                                       return_attn=True)
+
+                            # answer new query
+                            # ans_new, chosen_attr, gt_attrs_rem  = \
+                            #     answer_single_query(q_new.reshape(N, max_num_attributes, max_num_objects),
+                            #                         gt_attrs_rem)
+
+                            if self.args.experiment_type == 'attributes':
+                                ans_all = \
+                                    answer_queries(q_new.reshape(batch_size, self.max_num_attributes, self.max_num_objects),
+                                                   attrs, ans_all)
+                            else:
+                                ans_all = attrs
+
+                            ans_new = ans_all * q_new
+                            # select the asked queries in their embeddings according to the answers.
+
+                            bool_pos, bool_neg = (ans_new > 0), (ans_new < 0)
+
+
+                            q_mask = torch.clamp(q_new + q_mask.reshape(*q_new.shape), 0, 1)
+
+                            # select the asked queries in their embeddings according to the answers.
+                            cond_pos = torch.where(bool_pos, attr_embeds, cond_pos) * q_mask
+                            cond_neg = torch.where(bool_neg, attr_embeds_neg, cond_neg) * q_mask
+                            cond_unasked = torch.where(ans_new != 0, torch.zeros_like(cond_unasked), cond_unasked)
+
+                            ans_pos = torch.where(bool_pos, torch.ones_like(ans_pos), ans_pos) * q_mask
+                            ans_neg = torch.where(bool_neg, torch.ones_like(ans_pos), ans_neg) * q_mask
+                            ans_unasked = torch.where(ans_new != 0, torch.zeros_like(ans_unasked), ans_unasked)
+
+
+                else: raise NotImplementedError
+
+
+
+                # Get new query with gradients.
+                if prob_ask < max_prob and self.args.train_querier: # TODO: Set back to true to train querier.
+
+                    # Note: code to get encodings for the querier
+                    out_query_features = None
+                    if self.encode_query_features:
+                        with torch.no_grad():
+                            attr_embeds_ = self.query_encoder(cond=(cond_pos, cond_neg),
+                                                                 ans=(ans_pos, ans_neg),
+                                                                 cond_att=cond_att,
+                                                                 ans_att=ans_att)
+                            # attr_tokens_ = self.to_text_non_attn_cond(attr_embeds_)
+                            out_query_features = self.process_tokens(attr_embeds_)
+
+                    in_embeds = torch.stack([cond_pos, cond_neg], dim=-1)
+                    in_embeds_all = torch.stack([cond_pos_all_o, cond_neg_all_o], dim=-1)
+                    in_ans = torch.stack([ans_pos, ans_neg], dim=-1)
+                    q_new_flat, q_soft_flat = self.querier(cond=in_embeds, cond_all=in_embeds_all, ans=in_ans, image=cond_images, image_features=out_clean_features,
+                                                       query_features=out_query_features, mask=q_mask.reshape(batch_size, -1))
+
+                    soft = False
+                    if soft:
+                        q_new = q_soft_flat
+                    else:
+                        q_new = q_new_flat
+                    # answer new query
+                    # ans_new, _, _ = answer_single_query(q_new.reshape(batch_size, self.max_num_attributes, self.max_num_objects),
+                    #                               gt_attrs_rem)
+                    if self.args.experiment_type == 'attributes':
+                        ans_all = answer_queries(
+                            q_new.reshape(batch_size, self.max_num_attributes, self.max_num_objects),
+                            attrs, ans_all)
+                    else:
+                        ans_all = attrs
+
+                    # k = 4
+                    # if soft and k > 1:
+                    #     q_new_k = torch.topk(q_new, k, dim=1, largest=True, sorted=True)
+                    #     q_new_k_mask = torch.zeros_like(q_new).scatter(1, q_new_k.indices, 1)
+                    #     top_k = (q_new * q_new_k_mask)
+                    #     q_new = top_k.detach() - q_new.detach() + q_new
+                        # q_new = q_new / (q_new.sum(dim=1, keepdim=True) + 1e-10) # normalize
+                    ans_new = ans_all * q_new
+
+                    # Apply orthogonality loss
+
+
+                    loss_orth = loss_orth_fn(q_soft_flat)
+                    alpha = 0.000001 # 000
+                    aux_losses = {'loss_orth': (alpha, loss_orth)}
+
+                    bool_pos, bool_neg = (ans_new > 0), (ans_new < 0)
+
+                    if self.attention_querier:
+                        ans_new_pos = torch.where(bool_pos, ans_new, torch.zeros_like(ans_pos)).sum(1, keepdims=True)
+                        ans_new_neg = torch.where(bool_neg, ans_new, torch.zeros_like(ans_neg)).sum(1, keepdims=True)
+
+                        # obj_embed = self.query_encoder.object_embedding(batch_size, device)
+                        # cond_pos_obj = torch.cat([cond_pos, obj_embed], dim=-1)
+                        # cond_neg_obj = torch.cat([cond_neg, obj_embed], dim=-1)
+                        cond_new_pos = torch.where(bool_pos, cond_pos_all_o * q_new,
+                                                   torch.zeros_like(cond_pos_all_o)).sum(1, keepdims=True)
+                        cond_new_neg = torch.where(bool_neg, cond_neg_all_o * q_new,
+                                                   torch.zeros_like(cond_neg_all_o)).sum(1, keepdims=True)
+
+                        # q_mask = torch.cat([q_mask, torch.ones_like(q_mask[:, 0, 0][:, None])], dim=-1)
+                        # ans_pos = torch.cat([ans_pos, ans_new_pos], dim=1)
+                        # ans_neg = torch.cat([ans_neg, ans_new_neg], dim=1)
+                        # cond_pos = torch.cat([cond_pos, cond_new_pos], dim=1)
+                        # cond_neg = torch.cat([cond_neg, cond_new_neg], dim=1)
+                        # select the asked queries in their embeddings according to the answers.
+
+                        cond_att = (cond_new_pos, cond_new_neg)
+                        ans_att = (ans_new_pos, ans_new_neg)
+                    else:
+
+                        q_mask = torch.clamp(q_new + q_mask.reshape(*q_new.shape), 0, 1)
+
+                        # select the asked queries in their embeddings according to the answers.
+                        cond_pos = torch.where(bool_pos, attr_embeds, cond_pos) * q_mask
+                        cond_neg = torch.where(bool_neg, attr_embeds_neg, cond_neg) * q_mask
+                        cond_unasked = torch.where(ans_new != 0, torch.zeros_like(cond_unasked), cond_unasked)
+
+                        ans_pos = torch.where(bool_pos, torch.ones_like(ans_pos), ans_pos) * q_mask
+                        ans_neg = torch.where(bool_neg, torch.ones_like(ans_pos), ans_neg) * q_mask
+                        ans_unasked = torch.where(ans_new != 0, torch.zeros_like(ans_unasked), ans_unasked)
+
+                        cond_att = None
+                        ans_att = None
+
+            # 0-out the attributes with certain probability (for class-free guidance)
+            # TODO: check that it's nulled if indicated as unconditional.
+            if (self.args.train_querier and self.args.freeze_unet) or self.args.all_queries:
+                cond_drop_prob = 0
+            attr_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device)
+            attr_keep_mask_hidden = rearrange(attr_keep_mask, 'b -> b 1 1')
+            #null_attr_hidden = self.null_attr_hidden.to(t.dtype)
+            # For Guidance
+            # null_attr_hidden = self.cond_embedding(torch.zeros_like(q))
+
+            cond_pos = torch.where(
+                attr_keep_mask_hidden,
+                cond_pos,
+                torch.zeros_like(cond_pos)
+            )
+            cond_neg = torch.where(
+                attr_keep_mask_hidden,
+                cond_neg,
+                torch.zeros_like(cond_neg)
+            )
+            # cond_unasked = torch.where(
+            #     attr_keep_mask_hidden,
+            #     cond_unasked,
+            #     zero_embed,
             # )
-            # attr_embeds = self.cond_embedding((q_pos.reshape(batch_size, -1)))
 
-            attr_embeds = self.cond_embedding(q)
-            attr_embeds_neg = self.cond_embedding_neg(q)
-            # TODO: Consider stop answering if "NO" has been reached.
-            attr_embeds_enc = self.query_encoder((attr_embeds, attr_embeds_neg), ans)
-
-            # Option 2: Only queries fitting in slots.
-            # q_keep_mask = prob_mask_like(attrs.shape, 1 - 0.3, device=device)  # - 0.3
-            # q = attrs_2.clone()
-            # q = torch.where(
-            #     q_keep_mask,
-            #     q,
-            #     torch.zeros_like(q)
+            # For Guidance
+            ans_pos_enc = torch.where(
+                attr_keep_mask_hidden,
+                ans_pos,
+                torch.zeros_like(ans_pos)
+            )
+            ans_neg_enc = torch.where(
+                attr_keep_mask_hidden,
+                - ans_neg,
+                torch.zeros_like(ans_pos)
+            )
+            # ans_unasked_enc = torch.where(
+            #     attr_keep_mask_hidden,
+            #     self.null_val * ans_unasked,
+            #     self.null_val * torch.ones_like(ans_unasked),
             # )
 
-            # Embed codes
-            # attr_embeds = self.cond_embedding(q)
 
-            # Aggregate (encode) attributes with a transformer. Note: Unused
-            # cls_token = self.cls_token.to(attr_embeds.dtype).repeat_interleave(batch_size, dim=0)
-            # attr_embeds = torch.cat([cls_token, attr_embeds], dim=1)
+            # Get the final condition vector from encoding the embeddings
+            # print(ans_pos_enc[0] - ans_neg_enc[0])
+            t_cond = (cond_pos, cond_neg)
+            t_ans = (ans_pos_enc, ans_neg_enc)
+            if self.query_decoder:
+                S, S_dec, attr_embeds_enc = self.query_encoder(cond=t_cond,
+                                                            ans=t_ans)
+                loss_rec = self.loss_rec(S_dec, S)
+                alpha = 0.01
+                aux_losses = {'loss_rec': (alpha, loss_rec)}
+            else:
+                attr_embeds_enc = self.query_encoder(cond=t_cond,
+                                                     ans=t_ans,
+                                                     cond_att=cond_att,
+                                                     ans_att=ans_att)
 
-            # Option 1: All possible queries
-            # attr_embeds = torch.cat([attr_embeds, ans[:, :, None]], dim=-1)
-            # attr_embeds_enc = self.query_encoder(attr_embeds, ans[:, :, None]) # reduce='cls'
 
-            # Option 2: Only queries fitting in slots.
-            # attr_embeds_enc = self.query_encoder(attr_embeds)
-
-            attr_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device = device)
-            attr_keep_mask_hidden = rearrange(attr_keep_mask, 'b -> b 1')
 
             attr_tokens = attr_embeds_enc
-            # attr_tokens = self.text_to_cond(attr_embeds_enc) # Limit here the size
-            #
-            # null_attr_embed = self.null_attr_embed.to(attr_tokens.dtype) # for some reason pytorch AMP not working
-            #
-            # attr_tokens = torch.where(
-            #     attr_keep_mask_embed,
-            #     attr_tokens,
-            #     null_attr_embed
-            # )
 
-            attr_hiddens = self.to_text_non_attn_cond(attr_tokens)
+            c_mask = ((ans_neg_enc != 0).logical_or(ans_pos_enc != 0))[..., 0]
 
-            null_attr_hidden = self.null_attr_hidden.to(t.dtype)
 
-            attr_hiddens = torch.where(
-                attr_keep_mask_hidden,
-                attr_hiddens,
-                null_attr_hidden
+            # print(c_mask.sum())
+            if self.attention_querier and not self.args.all_queries and self.args.train_querier:
+                c_mask = F.pad(c_mask, (0, 1), value=True)
+
+            # TODO: restore and check.
+            c_mask = torch.where(
+                attr_keep_mask_hidden[..., 0],
+                c_mask,
+                False
             )
-            # # TODO: What is the point here? Why hiddens and embeds are masked twice
-
-            t = t + attr_hiddens
-
+            attr_hiddens = self.to_text_non_attn_cond(attr_tokens)
+            if len(attr_tokens.shape) == 3:
+                attr_hiddens_out = attr_hiddens.sum(1) #.sum(1) # Note: Uncomment this and switch above for flatten_attr_process_token
+                text_tokens = self.process_tokens(attr_tokens)
+            else:
+                print('we must have more than one attribute token')
+                exit()
+            t = t #+ attr_hiddens_out
             # text conditioning
-        text_tokens = None
 
-        # Note: Old Text embeds
-        # if exists(text_embeds) and self.cond_on_text:
-        #
-        #     # conditional dropout
-        #
-        #     text_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device = device)
-        #
-        #     text_keep_mask_embed = rearrange(text_keep_mask, 'b -> b 1 1')
-        #     text_keep_mask_hidden = rearrange(text_keep_mask, 'b -> b 1')
-        #
-        #     # calculate text embeds
-        #
-        #     text_tokens = self.text_to_cond(text_embeds)
-        #     text_tokens = text_tokens[:, :self.max_text_len]
-        #
-        #     if exists(text_mask):
-        #         text_mask = text_mask[:, :self.max_text_len]
-        #
-        #     text_tokens_len = text_tokens.shape[1]
-        #     remainder = self.max_text_len - text_tokens_len
-        #
-        #     if remainder > 0:
-        #         text_tokens = F.pad(text_tokens, (0, 0, 0, remainder))
-        #
-        #     if exists(text_mask):
-        #         if remainder > 0:
-        #             text_mask = F.pad(text_mask, (0, remainder), value = False)
-        #
-        #         text_mask = rearrange(text_mask, 'b n -> b n 1')
-        #         text_keep_mask_embed = text_mask & text_keep_mask_embed
-        #
-        #     null_text_embed = self.null_text_embed.to(text_tokens.dtype) # for some reason pytorch AMP not working
-        #
-        #     text_tokens = torch.where(
-        #         text_keep_mask_embed,
-        #         text_tokens,
-        #         null_text_embed
-        #     )
-        #
-        #     if exists(self.attn_pool): # WTH is this?
-        #         text_tokens = self.attn_pool(text_tokens)
-        #
-        #     # extra non-attention conditioning by projecting and then summing text embeddings to time
-        #     # termed as text hiddens
-        #
-        #     mean_pooled_text_tokens = text_tokens.mean(dim = -2)
-        #
-        #     text_hiddens = self.to_text_non_attn_cond(mean_pooled_text_tokens)
-        #
-        #     null_text_hidden = self.null_text_hidden.to(t.dtype)
-        #
-        #     text_hiddens = torch.where(
-        #         text_keep_mask_hidden,
-        #         text_hiddens,
-        #         null_text_hidden
-        #     )
-        #
-        #     t = t + text_hiddens
-
-        # main conditioning tokens (c)
-
-        c = time_tokens if not exists(text_tokens) else torch.cat((time_tokens, text_tokens), dim = -2)
+        # c = time_tokens if not exists(text_tokens) else torch.cat((time_tokens, text_tokens), dim = -2)
+        c = time_tokens if not exists(text_tokens) else text_tokens
 
         # normalize conditioning tokens
 
-        c = self.norm_cond(c)
+        # c = self.norm_cond(c) # TODO: check again
 
         # initial resnet block (for memory efficient unet)
 
         if exists(self.init_resnet_block):
-            x = self.init_resnet_block(x, t)
-
+            x = self.init_resnet_block(x, t) # Not in here
         # go through the layers of the unet, down and up
 
         hiddens = []
@@ -1848,24 +2212,25 @@ class Unet(nn.Module):
             if exists(pre_downsample):
                 x = pre_downsample(x)
 
-            x = init_block(x, t, c)
+            x = init_block(x, t, c, c_mask)
 
             for resnet_block in resnet_blocks:
                 x = resnet_block(x, t)
                 hiddens.append(x)
 
-            x = attn_block(x, c)
+            x = attn_block(x, c, c_mask)
             hiddens.append(x)
 
             if exists(post_downsample):
                 x = post_downsample(x)
 
-        x = self.mid_block1(x, t, c)
+        x = self.mid_block1(x, t, c, c_mask) # [16, 256, 16, 16] # self.noise_schedulers[unet_index](torch.zeros((x.shape[0]), device = x.device)), argument: cond_dim = None
 
         if exists(self.mid_attn):
-            x = self.mid_attn(x)
+            x = self.mid_attn(x) # [16, 256, 16, 16]
+            # x = self.mid_attn(x, c) # [16, 256, 16, 16] # Note: last change
 
-        x = self.mid_block2(x, t, c)
+        x = self.mid_block2(x, t, c, c_mask) # [16, 256, 16, 16]
 
         add_skip_connection = lambda x: torch.cat((x, hiddens.pop() * self.skip_connect_scale), dim = 1)
 
@@ -1898,7 +2263,7 @@ class Unet(nn.Module):
         if exists(lowres_cond_img):
             x = torch.cat((x, lowres_cond_img), dim = 1)
 
-        return self.final_conv(x)
+        return self.final_conv(x), aux_losses, aux_outputs
 
 # null unet
 
@@ -2336,7 +2701,7 @@ class Imagen(nn.Module):
                 is_last_resample_step = r == 0
 
                 if has_inpainting:
-                    noised_inpaint_images, *_ = noise_scheduler.q_sample(inpaint_images, t = times)
+                    noised_inpaint_images, *_ = noise_scheduler.q_sexample(inpaint_images, t = times)
                     img = img * ~inpaint_masks + noised_inpaint_images * inpaint_masks
 
                 self_cond = x_start if unet.self_cond else None
@@ -2400,12 +2765,22 @@ class Imagen(nn.Module):
         return_all_unet_outputs = False,
         return_pil_images = False,
         device = None,
-        use_tqdm = True
+        use_tqdm = True,
+        num_samples = 1
     ):
         device = default(device, self.device)
         self.reset_unets_all_one_device(device = device)
 
         cond_images = maybe(cast_uint8_images_to_float)(cond_images)
+
+        #
+        print(f"Repeating samples {num_samples} times.")
+        if text_embeds is not None and num_samples > 1:
+            text_embeds = torch.repeat_interleave(text_embeds[:, None], num_samples, 1).flatten(0,1)
+        if cond_images is not None and num_samples > 1:
+            cond_images = torch.repeat_interleave(cond_images[:, None], num_samples, 1).flatten(0,1)
+        if num_samples > 1:
+            batch_size *= num_samples
 
         if exists(texts) and not exists(text_embeds) and not self.unconditional:
             assert all([*map(len, texts)]), 'text cannot be empty'
@@ -2597,7 +2972,6 @@ class Imagen(nn.Module):
             lowres_cond_img_noisy, *_ = self.lowres_noise_schedule.q_sample(x_start = lowres_cond_img, t = lowres_aug_times, noise = torch.randn_like(lowres_cond_img))
 
         # time condition
-
         noise_cond = noise_scheduler.get_condition(times)
 
         # unet kwargs
@@ -2620,7 +2994,7 @@ class Imagen(nn.Module):
 
         if self_cond and random() < 0.5:
             with torch.no_grad():
-                pred = unet.forward(
+                pred, aux_losses, aux_outputs = unet.forward(
                     x_noisy,
                     noise_cond,
                     **unet_kwargs
@@ -2632,14 +3006,14 @@ class Imagen(nn.Module):
 
         # get prediction
 
-        pred = unet.forward(
+        pred, aux_losses, aux_outputs = unet.forward(
             x_noisy,
             noise_cond,
+            x_start = x_start,
             **unet_kwargs
         )
 
         # prediction objective
-
         if pred_objective == 'noise':
             target = noise
         elif pred_objective == 'x_start':
@@ -2655,6 +3029,13 @@ class Imagen(nn.Module):
         # losses
 
         losses = self.loss_fn(pred, target, reduction = 'none')
+        # masked_mse = False
+        # if masked_mse and 'masked_x' in aux_outputs:
+        #     mask = aux_outputs['masked_x'].clone()
+        #     mask[ mask != -10 ] = 1; mask[ mask == -10 ] = 0
+        #     mse_mask = (1-mask).detach()
+        #     losses = reduce(losses * mse_mask, 'b ... -> b', 'sum') / reduce(mse_mask, 'b ... -> b', 'sum')
+        # else:
         losses = reduce(losses, 'b ... -> b', 'mean')
 
         # p2 loss reweighting
@@ -2662,6 +3043,11 @@ class Imagen(nn.Module):
         if p2_loss_weight_gamma > 0:
             loss_weight = (self.p2_loss_weight_k + log_snr.exp()) ** -p2_loss_weight_gamma
             losses = losses * loss_weight
+
+        # adding auxiliary losses
+
+        for k, v in aux_losses.items():
+            losses = losses + v[0] * reduce(v[1], 'b ... -> b', 'mean')
 
         return losses.mean()
 
@@ -2705,7 +3091,14 @@ class Imagen(nn.Module):
 
         frames = images.shape[2] if is_video else None
 
-        times = noise_scheduler.sample_random_times(b, device = device)
+        ## For times = 1 we have pure noise.
+        if self.unets[0].args.train_querier and self.unets[0].args.freeze_unet and self.unets[0].args.constant_t > 0:
+            # print('Warning we are sampling a constant time')
+            # exit()
+            times = noise_scheduler.sample_constant_times(self.unets[0].args.constant_t, b, device = device)
+        else:
+            times = noise_scheduler.sample_random_times(b, device = device)
+        # times = noise_scheduler.sample_random_times(b, device = device)
 
         if exists(texts) and not exists(text_embeds) and not self.unconditional:
             assert all([*map(len, texts)]), 'text cannot be empty'
@@ -2741,376 +3134,14 @@ class Imagen(nn.Module):
         # Note: added contiguous
         return self.p_losses(unet, images, times, text_embeds = text_embeds, text_mask = text_masks, cond_images = cond_images, noise_scheduler = noise_scheduler, lowres_cond_img = lowres_cond_img, lowres_aug_times = lowres_aug_times, pred_objective = pred_objective, p2_loss_weight_gamma = p2_loss_weight_gamma, random_crop_size = random_crop_size)
 
-class QuerierUnet(nn.Module):
-    def __init__(
-            self,
-            *,
-            dim,
-            image_embed_dim = 1024,
-            text_embed_dim = get_encoded_dim(DEFAULT_T5_NAME),
-            num_resnet_blocks = 1,
-            cond_dim = None,
-            num_image_tokens = 4,
-            num_time_tokens = 2,
-            learned_sinu_pos_emb_dim = 16,
-            out_dim = None,
-            dim_mults=(1, 2, 4, 8),
-            cond_images_channels = 0,
-            channels = 3,
-            channels_out = None,
-            attn_dim_head = 64,
-            attn_heads = 8,
-            ff_mult = 2.,
-            lowres_cond = False,                # for cascading diffusion - https://cascaded-diffusion.github.io/
-            layer_attns = True,
-            layer_attns_depth = 1,
-            layer_mid_attns_depth = 1,
-            layer_attns_add_text_cond = True,   # whether to condition the self-attention blocks with the text embeddings, as described in Appendix D.3.1
-            attend_at_middle = True,            # whether to have a layer of attention at the bottleneck (can turn off for higher resolution in cascading DDPM, before bringing in efficient attention)
-            layer_cross_attns = True,
-            use_linear_attn = False,
-            use_linear_cross_attn = False,
-            cond_on_text = False,
-            max_text_len = 256,
-            init_dim = None,
-            resnet_groups = 8,
-            init_conv_kernel_size = 7,          # kernel size of initial conv, if not using cross embed
-            init_cross_embed = True,
-            init_cross_embed_kernel_sizes = (3, 7, 15),
-            cross_embed_downsample = False,
-            cross_embed_downsample_kernel_sizes = (2, 4),
-            attn_pool_text = True,
-            attn_pool_num_latents = 32,
-            dropout = 0.,
-            memory_efficient = False,
-            init_conv_to_final_conv_residual = False,
-            use_global_context_attn = True,
-            scale_skip_connection = True,
-            final_resnet_block = True,
-            final_conv_kernel_size = 3,
-            cosine_sim_attn = False,
-            self_cond = False,
-            combine_upsample_fmaps = False,      # combine feature maps from all upsample blocks, used in unet squared successfully
-            pixel_shuffle_upsample = True        # may address checkboard artifacts
-    ):
-        super().__init__()
 
-        # guide researchers
-
-        assert attn_heads > 1, 'you need to have more than 1 attention head, ideally at least 4 or 8'
-
-        if dim < 128:
-            print_once('The base dimension of your u-net should ideally be no smaller than 128, as recommended by a professional DDPM trainer https://nonint.com/2022/05/04/friends-dont-let-friends-train-small-diffusion-models/')
-
-        # save locals to take care of some hyperparameters for cascading DDPM
-        self.tau = 1.0
-
-        # determine dimensions
-
-        self.channels = channels
-        self.channels_out = default(channels_out, channels)
-
-        # (1) in cascading diffusion, one concats the low resolution image, blurred, for conditioning the higher resolution synthesis
-        # (2) in self conditioning, one appends the predict x0 (x_start)
-        init_channels = channels * (1 + int(lowres_cond) + int(self_cond))
-        init_dim = default(init_dim, dim)
-
-        self.self_cond = self_cond
-
-        # initial convolution
-
-        self.init_conv = CrossEmbedLayer(init_channels, dim_out = init_dim, kernel_sizes = init_cross_embed_kernel_sizes, stride = 1) if init_cross_embed else nn.Conv2d(init_channels, init_dim, init_conv_kernel_size, padding = init_conv_kernel_size // 2)
-
-        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
-        in_out = list(zip(dims[:-1], dims[1:]))
-
-        # time conditioning
-
-        cond_dim = None #default(cond_dim, dim)
-        time_cond_dim = None #dim * 4 * (2 if lowres_cond else 1) # TODO: try
-
-        # embedding time for log(snr) noise from continuous version
-
-        sinu_pos_emb = LearnedSinusoidalPosEmb(learned_sinu_pos_emb_dim)
-        sinu_pos_emb_input_dim = learned_sinu_pos_emb_dim + 1
-
-        # low res aug noise conditioning
-
-        self.lowres_cond = lowres_cond
-
-        # text encoding conditioning (optional)
-
-        self.text_to_cond = None
-
-        # finer control over whether to condition on text encodings
-
-        self.cond_on_text = cond_on_text
-
-        # attention pooling
-
-        # self.attn_pool = PerceiverResampler(dim = cond_dim, depth = 2, dim_head = attn_dim_head, heads = attn_heads, num_latents = attn_pool_num_latents, cosine_sim_attn = cosine_sim_attn) if attn_pool_text else None
-
-
-        # for non-attention based text conditioning at all points in the network where time is also conditioned
-
-        self.to_text_non_attn_cond = None
-
-
-        # attention related params
-
-        attn_kwargs = dict(heads = attn_heads, dim_head = attn_dim_head, cosine_sim_attn = cosine_sim_attn)
-
-        num_layers = len(in_out)
-
-        # resnet block klass
-
-        num_resnet_blocks = cast_tuple(num_resnet_blocks, num_layers)
-        resnet_groups = cast_tuple(resnet_groups, num_layers)
-
-        resnet_klass = partial(ResnetBlock, **attn_kwargs)
-
-        layer_attns = cast_tuple(layer_attns, num_layers)
-        layer_attns_depth = cast_tuple(layer_attns_depth, num_layers)
-        layer_cross_attns = cast_tuple(layer_cross_attns, num_layers)
-
-        use_linear_attn = cast_tuple(use_linear_attn, num_layers)
-        use_linear_cross_attn = cast_tuple(use_linear_cross_attn, num_layers)
-
-        assert all([layers == num_layers for layers in list(map(len, (resnet_groups, layer_attns, layer_cross_attns)))])
-
-        # downsample klass
-
-        downsample_klass = Downsample
-
-        if cross_embed_downsample:
-            downsample_klass = partial(CrossEmbedLayer, kernel_sizes = cross_embed_downsample_kernel_sizes)
-
-        # initial resnet block (for memory efficient unet)
-
-        self.init_resnet_block = resnet_klass(init_dim, init_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[0], use_gca = use_global_context_attn) if memory_efficient else None
-
-        # scale for resnet skip connections
-
-        self.skip_connect_scale = 1. if not scale_skip_connection else (2 ** -0.5)
-
-        # layers
-
-        self.downs = nn.ModuleList([])
-        self.ups = nn.ModuleList([])
-        num_resolutions = len(in_out)
-
-        layer_params = [num_resnet_blocks, resnet_groups, layer_attns, layer_attns_depth, layer_cross_attns, use_linear_attn, use_linear_cross_attn]
-        reversed_layer_params = list(map(reversed, layer_params))
-
-        # downsampling layers
-
-        skip_connect_dims = [] # keep track of skip connection dimensions
-
-        for ind, ((dim_in, dim_out), layer_num_resnet_blocks, groups, layer_attn, layer_attn_depth, layer_cross_attn, layer_use_linear_attn, layer_use_linear_cross_attn) in enumerate(zip(in_out, *layer_params)):
-            is_last = ind >= (num_resolutions - 1)
-
-            layer_cond_dim = cond_dim if layer_cross_attn or layer_use_linear_cross_attn else None
-
-            if layer_attn:
-                transformer_block_klass = TransformerBlock
-            elif layer_use_linear_attn:
-                transformer_block_klass = LinearAttentionTransformerBlock
-            else:
-                transformer_block_klass = Identity
-
-            current_dim = dim_in
-
-            # whether to pre-downsample, from memory efficient unet
-
-            pre_downsample = None
-
-            if memory_efficient:
-                pre_downsample = downsample_klass(dim_in, dim_out)
-                current_dim = dim_out
-
-            skip_connect_dims.append(current_dim)
-
-            # whether to do post-downsample, for non-memory efficient unet
-
-            post_downsample = None
-            if not memory_efficient:
-                post_downsample = downsample_klass(current_dim, dim_out) if not is_last else Parallel(nn.Conv2d(dim_in, dim_out, 3, padding = 1), nn.Conv2d(dim_in, dim_out, 1))
-
-            self.downs.append(nn.ModuleList([
-                pre_downsample,
-                resnet_klass(current_dim, current_dim, cond_dim = layer_cond_dim, linear_attn = layer_use_linear_cross_attn, time_cond_dim = time_cond_dim, groups = groups),
-                nn.ModuleList([ResnetBlock(current_dim, current_dim, time_cond_dim = time_cond_dim, groups = groups, use_gca = use_global_context_attn) for _ in range(layer_num_resnet_blocks)]),
-                transformer_block_klass(dim = current_dim, depth = layer_attn_depth, ff_mult = ff_mult, context_dim = cond_dim, **attn_kwargs),
-                post_downsample
-            ]))
-
-        # middle layers
-
-        mid_dim = dims[-1]
-
-        self.mid_block1 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
-        self.mid_attn = TransformerBlock(mid_dim, depth = layer_mid_attns_depth, **attn_kwargs) if attend_at_middle else None
-        self.mid_block2 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
-
-        # upsample klass
-
-        upsample_klass = Upsample if not pixel_shuffle_upsample else PixelShuffleUpsample
-
-        # upsampling layers
-
-        upsample_fmap_dims = []
-
-        for ind, ((dim_in, dim_out), layer_num_resnet_blocks, groups, layer_attn, layer_attn_depth, layer_cross_attn, layer_use_linear_attn, layer_use_linear_cross_attn) in enumerate(zip(reversed(in_out), *reversed_layer_params)):
-            is_last = ind == (len(in_out) - 1)
-
-            layer_cond_dim = cond_dim if layer_cross_attn or layer_use_linear_cross_attn else None
-
-            if layer_attn:
-                transformer_block_klass = TransformerBlock
-            elif layer_use_linear_attn:
-                transformer_block_klass = LinearAttentionTransformerBlock
-            else:
-                transformer_block_klass = Identity
-
-            skip_connect_dim = skip_connect_dims.pop()
-
-            upsample_fmap_dims.append(dim_out)
-
-            self.ups.append(nn.ModuleList([
-                resnet_klass(dim_out + skip_connect_dim, dim_out, cond_dim = layer_cond_dim, linear_attn = layer_use_linear_cross_attn, time_cond_dim = time_cond_dim, groups = groups),
-                nn.ModuleList([ResnetBlock(dim_out + skip_connect_dim, dim_out, time_cond_dim = time_cond_dim, groups = groups, use_gca = use_global_context_attn) for _ in range(layer_num_resnet_blocks)]),
-                transformer_block_klass(dim = dim_out, depth = layer_attn_depth, ff_mult = ff_mult, context_dim = cond_dim, **attn_kwargs),
-                upsample_klass(dim_out, dim_in) if not is_last or memory_efficient else Identity()
-            ]))
-
-        # whether to combine feature maps from all upsample blocks before final resnet block out
-
-        self.upsample_combiner = UpsampleCombiner(
-            dim = dim,
-            enabled = combine_upsample_fmaps,
-            dim_ins = upsample_fmap_dims,
-            dim_outs = dim
-        )
-
-        # whether to do a final residual from initial conv to the final resnet block out
-
-        self.init_conv_to_final_conv_residual = init_conv_to_final_conv_residual
-        final_conv_dim = self.upsample_combiner.dim_out + (dim if init_conv_to_final_conv_residual else 0)
-
-        # final optional resnet block and convolution out
-
-        self.final_res_block = ResnetBlock(final_conv_dim, dim, time_cond_dim = time_cond_dim, groups = resnet_groups[0], use_gca = True) if final_resnet_block else None
-
-        final_conv_dim_in = dim if final_resnet_block else final_conv_dim
-        final_conv_dim_in += (channels if lowres_cond else 0)
-
-        self.final_conv = nn.Conv2d(final_conv_dim_in, self.channels_out, final_conv_kernel_size, padding = final_conv_kernel_size // 2)
-
-        zero_init_(self.final_conv)
-        self.softmax = nn.Softmax(dim=-1)
-
-    # if the current settings for the unet are not correct
-    # for cascading DDPM, then reinit the unet with the right settings
-
-    def forward(
-            self,
-            x,
-            mask,
-            *,
-            lowres_cond_img = None,
-            lowres_noise_times = None,
-            text_embeds = None,
-            text_mask = None,
-            cond_images = None,
-            self_cond = None,
-            cond_drop_prob = 0.
-    ):
-        batch_size, device = x.shape[0], x.device
-
-        # initial convolution
-
-        x = self.init_conv(x)
-
-        # init conv residual
-
-        if self.init_conv_to_final_conv_residual:
-            init_conv_residual = x.clone()
-
-        # initial resnet block (for memory efficient unet)
-
-        if exists(self.init_resnet_block):
-            x = self.init_resnet_block(x)
-
-        # go through the layers of the unet, down and up
-
-        hiddens = []
-
-        for pre_downsample, init_block, resnet_blocks, attn_block, post_downsample in self.downs:
-            if exists(pre_downsample):
-                x = pre_downsample(x)
-
-            x = init_block(x)
-
-            for resnet_block in resnet_blocks:
-                x = resnet_block(x)
-                hiddens.append(x)
-
-            x = attn_block(x)
-            hiddens.append(x)
-
-            if exists(post_downsample):
-                x = post_downsample(x)
-
-        x = self.mid_block1(x)
-
-        if exists(self.mid_attn):
-            x = self.mid_attn(x)
-
-        x = self.mid_block2(x)
-
-        add_skip_connection = lambda x: torch.cat((x, hiddens.pop() * self.skip_connect_scale), dim = 1)
-
-        up_hiddens = []
-
-        for init_block, resnet_blocks, attn_block, upsample in self.ups:
-            x = add_skip_connection(x)
-            x = init_block(x)
-
-            for resnet_block in resnet_blocks:
-                x = add_skip_connection(x)
-                x = resnet_block(x)
-
-            x = attn_block(x)
-            up_hiddens.append(x.contiguous())
-            x = upsample(x)
-
-        # whether to combine all feature maps from upsample blocks
-
-        x = self.upsample_combiner(x, up_hiddens)
-
-        # final top-most residual if needed
-
-        if self.init_conv_to_final_conv_residual:
-            x = torch.cat((x, init_conv_residual), dim = 1)
-
-        if exists(self.final_res_block):
-            x = self.final_res_block(x)
-
-        if exists(lowres_cond_img):
-            x = torch.cat((x, lowres_cond_img), dim = 1)
-
-        x = self.final_conv(x)
-
-        query_logits = x.view(x.shape[0], -1)
-        query_mask = torch.where(mask == 1, -1e9, 0.) # TODO: Check why.
-        query_logits = query_logits + query_mask.to(device)
-
-        # straight through softmax
-        eps = 1e-8
-        query = self.softmax((query_logits + eps) / self.tau)
-        _, max_ind = (query).max(1)
-        query_onehot = F.one_hot(max_ind, query.shape[1]).type(query.dtype)
-        query = (query_onehot - query).detach() + query
-        return query
-
-
+def loss_orth_fn(q):
+    q = torch.clamp(q, min=0.00001, max=0.999)
+    # print(q.max(), q.min())
+    a, b = q[None], q[:, None]
+    # e = a * b
+    # e = (torch.log(a) + torch.log(b))
+    cross_entropy = nn.BCELoss(reduction='none')
+    e = -cross_entropy(torch.repeat_interleave(a, q.shape[0], 0),
+                       torch.repeat_interleave(b, q.shape[0], 1))
+    return e

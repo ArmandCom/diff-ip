@@ -43,104 +43,30 @@ import numpy as np
 #         return x
 
 
-class Querier(nn.Module):
-    def __init__(self, tau=1.0, num_queries=100, query_dim=64, in_channels=1, num_layers=6, num_heads=8, dropout=0.0):
-        super().__init__()
-        self.tau = tau
+# class QueryEncoder(nn.Module):
+#     def __init__(self, query_dim=64, num_layers=3, num_heads=5, dropout=0.0):
+#         super().__init__()
+#
+#         self.query_dim = query_dim
+#         encoder_layer = nn.TransformerEncoderLayer(d_model=query_dim, nhead=num_heads)
+#         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+#         # # Transformer usage:
+#         # # src = torch.rand(10, 32, 512)
+#         # # out = self.transformer_encoder(src)
+#
+#     def forward(self, x, reduce='avg_pooling'):
+#         out = self.transformer_encoder(x)
+#         # Note: Average for now.
+#         if reduce == 'avg_pooling':
+#             out = out.mean(1)
+#         elif reduce == 'max_pooling':
+#             out = out.max(1)[0]
+#         elif reduce == 'cls':
+#             out = out[:, 0]
+#         else: raise NotImplementedError
+#         return out
 
-        # Step 1: Encode Information about the image
-        # self.encode_image = FeatureExtractor()
-        # self.perceive = PerceiverResampler( # medias = torch.randn(1, 2, 256, 1024) # (batch, time, sequence length, dimension)
-        #     dim = 1024,
-        #     depth = 2,
-        #     dim_head = 64,
-        #     heads = 8,
-        #     num_latents = 64,    # the number of latents to shrink your media sequence to, perceiver style
-        #     num_media_embeds = 1  # say you have 4(1 in this case) images maximum in your dialogue
-        # )
-        #
-        # self.feature_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224-in21k")
-        # self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
-        # # Example
-        # # inputs = self.feature_extractor(image, return_tensors="pt") # Note: Do in loader
-        # # with torch.no_grad():
-        # #     outputs = model(**inputs)
-
-
-        self.softmax = nn.Softmax(dim=-1)
-
-        # Create embeddings for each attribute
-        self.embedding = nn.Embedding(num_queries, query_dim) # max_norm=True ?
-
-        # Transformer (group embeddings)
-
-        encoder_layer = nn.TransformerEncoderLayer(d_model=query_dim, nhead=8)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=6)
-        # src = torch.rand(10, 32, 512)
-        # out = self.transformer_encoder(src)
-
-        self.query_dim = query_dim
-
-    def update_tau(self, tau):
-        self.tau = tau
-
-    def embed_code(self, embed_id):
-        return F.embedding(embed_id, self.embedding.transpose(0, 1))
-
-    def forward(self, x, mask, return_attn = False):
-        device = x.device
-
-        print(x.shape)
-        # inputs = self.feature_extractor(x[:, :3], return_tensors="pt")
-        # print(inputs)
-        # input('s')
-        with torch.no_grad():
-            outputs = self.vit(**inputs)
-        print(outputs.shape)
-        exit()
-        # x = self.encode_image(x)
-        # print(x.shape)
-        x = self.perceive(x)
-        print(x.shape)
-        exit()
-
-        query_logits = x.view(x.shape[0], -1)
-        query_mask = torch.where(mask == 1, -1e9, 0.) # TODO: Check why.
-        query_logits = query_logits + query_mask.to(device)
-
-        # straight through softmax
-        query = self.softmax(query_logits / self.tau)
-        _, max_ind = (query).max(1)
-        query_onehot = F.one_hot(max_ind, query.shape[1]).type(query.dtype)
-        query = (query_onehot - query).detach() + query
-
-        x = self.embedding(query) * math.sqrt(self.query_dim)
-
-        return query
-
-class QueryEncoder(nn.Module):
-    def __init__(self, query_dim=64, num_layers=3, num_heads=5, dropout=0.0):
-        super().__init__()
-
-        self.query_dim = query_dim
-        encoder_layer = nn.TransformerEncoderLayer(d_model=query_dim, nhead=num_heads)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        # # Transformer usage:
-        # # src = torch.rand(10, 32, 512)
-        # # out = self.transformer_encoder(src)
-
-    def forward(self, x, reduce='avg_pooling'):
-        out = self.transformer_encoder(x)
-        # Note: Average for now.
-        if reduce == 'avg_pooling':
-            out = out.mean(1)
-        elif reduce == 'max_pooling':
-            out = out.max(1)[0]
-        elif reduce == 'cls':
-            out = out[:, 0]
-        else: raise NotImplementedError
-        return out
-
+#TODO: vertical + horizontal Linears intercalated.
 class QueryLinearEncoder(nn.Module):
     def __init__(self, attr_dim, n_obj, out_dim, embed_dim, reduce=None, add_answer='keep_pos'):
         super().__init__()
@@ -157,7 +83,6 @@ class QueryLinearEncoder(nn.Module):
             self.fc = nn.Linear(attr_dim * n_obj, 1)
         elif self.reduce == 'linear_per_attr':
             self.fc = nn.Linear(attr_dim, 1)
-
         if self.add_answer == 'linear_merge':
             self.ans_fc = nn.Linear(1, embed_dim, bias=False)
 
@@ -169,8 +94,8 @@ class QueryLinearEncoder(nn.Module):
                 ans[ans != 1] = 0
                 x = x * ans
             elif self.add_answer == 'pos_neg':
-                ans_neg = ans.clone()
-                ans_pos = ans.clone()
+                ans_neg = torch.zeros_like(ans)
+                ans_pos = torch.zeros_like(ans)
                 ans_neg[ans == -1] = 1
                 ans_pos[ans == 1] = 1
                 if isinstance(x, tuple):
@@ -218,7 +143,137 @@ class QueryLinearEncoder(nn.Module):
             out = x.reshape(x.shape[0], self.embed_dim)
         return out
 
-def answer_queries(q, gt_attrs):
+class QueryEncoder(nn.Module):
+    def __init__(self, attr_dim, n_obj, out_dim, embed_dim, reduce=None, use_answers=False, add_answer='keep_pos'):
+        super().__init__()
+        self.reduce = reduce
+        self.add_answer = add_answer
+        self.attr_dim = attr_dim
+        self.n_obj = n_obj
+        self.embed_dim = embed_dim
+        self.out_dim = out_dim
+        self.use_answers = use_answers
+        if not use_answers:
+            if self.reduce == 'linear_all':
+                self.fc = nn.Linear(attr_dim * n_obj * embed_dim, out_dim)
+            elif self.reduce == 'linear_per_filter':
+                self.fc = nn.Linear(attr_dim * n_obj, 1)
+            elif self.reduce == 'linear_per_attr':
+                self.fc = nn.Linear(attr_dim, 1)
+            elif self.reduce == 'pos_neg_sum_max_pooling':
+                pass
+            if self.add_answer == 'linear_merge':
+                self.ans_fc = nn.Linear(1, embed_dim, bias=False)
+            self.act = nn.SiLU()
+
+        self.cond_embedding_nobj = nn.Embedding(n_obj,
+                                                embed_dim)  # , padding_idx=0 , max_norm=True #TODO: review the in_channels
+
+    def object_embedding(self, batch_size, device):
+        return self.cond_embedding_nobj(torch.arange(self.n_obj).to(device))[None, None, :, :] \
+            .repeat(batch_size, self.attr_dim, 1, 1).reshape(-1, self.attr_dim * self.n_obj, self.embed_dim)
+    def forward(self, cond, ans=None, cond_att=None, ans_att=None):
+        bs = cond[0].shape[0]
+        if not self.use_answers:
+            x = cond
+            if self.reduce == 'flatten':
+                x_pos, x_neg = x[0], x[1]
+                x_all = x_pos + x_neg
+                if len(x) == 3:
+                    x_all = x_all + x[2]
+                x_all = x_all.reshape(bs, self.attr_dim * self.n_obj * self.embed_dim)
+                out = x_all.reshape(x_all.shape[0], -1)
+
+            elif self.reduce == 'flatten_obj':
+                x_pos, x_neg = x[0], x[1]
+                x_all = x_pos + x_neg
+                if len(x) == 3:
+                    x_all = x_all + x[2]
+                # torch.cat([x_pos, x_neg], dim=1) # There shouldn't be overlap
+                out = x_all.reshape(bs, self.attr_dim, -1)
+
+            elif self.reduce == 'single_queries':
+                device, batch_size = x[0].device, x[0].shape[0]
+
+                x_pos, x_neg = x[0], x[1]
+                x_all = x_pos + x_neg
+                if len(x) == 3:
+                    x_all = x_all + x[2]
+                obj_embed = self.object_embedding(batch_size, device)
+                x_all_o = torch.cat([x_all, obj_embed], dim=-1) # TODO: unasked xs are also given the object embedding. not a problem at the moment because we use a mask for the conditions, but might be in the future
+                out = x_all_o.reshape(bs, self.attr_dim * self.n_obj, -1)
+
+                if cond_att is not None:
+                    x_pos, x_neg = cond_att[0], cond_att[1]
+                    x_all = x_pos + x_neg
+                    out = torch.cat([out, x_all.reshape(bs, 1, -1)], dim=1)
+                    # TODO: if elements in batch are zeroed, zero this one too.
+                    #  But this only matters when training the diffuser.
+
+        else:
+            if ans_att is not None:
+                raise NotImplementedError
+            x = ans
+            x_pos, x_neg = x[0], x[1]
+            x_all = x_pos + x_neg
+            if len(x) == 3:
+                x_all = x_all + x[2]
+            out = x_all.reshape(-1, self.attr_dim * self.n_obj * 1)
+        return out
+
+
+def answer_queries(q, gt_attrs, all_a=None):
+    '''
+    :param q: [q x num_attr x max_obj], binary
+    :param gt_attrs: [b x max_obj]
+    :return:
+    '''
+    add_nobj = True
+    batch, nat, nobj = q.shape
+    if add_nobj:
+        gtat = gt_attrs.clone()
+        gtat[gtat != 0] = 1
+        nobj = gtat.sum(1)
+    if all_a is None:
+        all_a = torch.zeros_like(q)
+        for b in range(batch):
+            if gt_attrs[b].sum() > 0:
+                bins = torch.bincount(gt_attrs[b], minlength=nat+1)[1:] # works with 1-d vectors
+                for at_id in range(nat):
+                    n_instances = bins[at_id]
+                    all_a[b, at_id, :n_instances] = 1
+                    all_a[b, at_id, n_instances:] = -1
+            if add_nobj:
+                all_a[b, -1, :nobj[b]] = 1
+                all_a[b, -1, nobj[b]:] = -1
+
+    # else: all_a = all_a.reshape(batch, nat, nobj)
+
+    return all_a.reshape(batch, -1, 1).type(torch.cuda.FloatTensor)
+
+def answer_single_query(q, gt_attrs_rem):
+    '''
+    :param q: [q x num_attr x max_obj], binary
+    :param gt_attrs: [b x max_obj]
+    :return:
+    '''
+
+    batch, _, _ = q.shape
+    # q = q.reshape(batch, -1)
+    a = torch.zeros_like(q[:, 0, 0])
+    chosen_attrs = a.clone()
+    for b in range(batch):
+        v, vid = q[b].max(1)[0].max(0)
+        if (vid+1) in gt_attrs_rem[b]:
+            a[b] = 1
+            id = torch.abs(gt_attrs_rem[b] - (vid+1)).min(0)[1]
+            gt_attrs_rem[b, id] = 0
+        else:
+            a[b] = -1
+        chosen_attrs[b] = vid + 1
+    return a.reshape(batch, 1, 1), chosen_attrs.reshape(batch, 1), gt_attrs_rem.reshape(batch, -1)
+
+def answer_queries_hierarchical(q, gt_attrs):
     '''
     :param q: [q x num_attr x max_obj], binary
     :param gt_attrs: [b x max_obj]
@@ -241,138 +296,30 @@ def answer_queries(q, gt_attrs):
     # TODO: answer si: sum object embeddings in each attribute. Then max_pool in attribute dimension.
     #       answer no: max_pool in object dimension and max_pool in attribute dimension
     #       sum all
-    return attrs.reshape(batch, -1), a.reshape(batch, -1, 1).type(torch.cuda.FloatTensor)
+    return attrs.reshape(batch, -1), a.reshape(batch, -1, 1).type(torch.cuda.FloatTensor), gt_attrs.reshape(batch, -1)
 
+def answer_single_query_hierarchical(q, gt_attrs_rem):
+    '''
+    :param q: [q x num_attr x max_obj], binary
+    :param gt_attrs: [b x max_obj]
+    :return:
+    '''
 
-class QueryAggregator(nn.Module):
-    def __init__(self, tau=1.0, num_queries=100, query_dim=64, in_channels=1, num_layers=6, num_heads=8, dropout=0.0):
-        super().__init__()
+    batch, _, _ = q.shape
+    # q = q.reshape(batch, -1)
+    a = torch.zeros_like(q[:, 0, 0])
+    chosen_attrs = a.clone()
+    for b in range(batch):
+        v, vid = q[b].max(1)[0].max(0)
+        if (vid+1) in gt_attrs_rem[b]:
+            a[b] = 1
+            id = torch.abs(gt_attrs_rem[b] - (vid+1)).min(0)[1]
+            gt_attrs_rem[b, id] = 0
+        else:
+            a[b] = -1
+        chosen_attrs[b] = vid + 1
+    return a.reshape(batch, 1, 1), chosen_attrs.reshape(batch, 1), gt_attrs_rem.reshape(batch, -1)
 
-        # Positional embedding
-        self.pos_encoder = PositionalEncoding(query_dim, dropout=dropout)
-
-        # Embeddings
-        self.embedding = nn.Embedding(num_queries, query_dim) # max_norm=True ?
-
-        # Transformer (group embeddings)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=query_dim, nhead=8)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=6)
-        # src = torch.rand(10, 32, 512)
-        # out = self.transformer_encoder(src)
-
-        self.query_dim = query_dim
-
-    def forward(self, updated_mask, true_labels):
-
-        x = self.embedding(updated_mask) * math.sqrt(self.query_dim)
-        # Append answers with true_labels.
-        # x = self.pos_encoder(x) #Note: Only if we care about the order, but we might not as the objects have no order. It is a Set
-        S = self.transformer_encoder(x, updated_mask)
-
-        return S
-
-class Querier128Flat(nn.Module):
-    def __init__(self, tau=1.0, query_size = (26, 26), in_channels=1):
-        super().__init__()
-        self.tau = tau
-        # in_channels += 4
-        # in_channels = 1
-
-        # ENCODER
-        self.conv1 = nn.Conv2d(in_channels, 32, 3)
-        self.bnorm1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, 3)
-        self.bnorm2 = nn.BatchNorm2d(64)
-
-        self.conv3 = nn.Conv2d(64, 128, 3)
-        self.bnorm3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 256, 3)
-        self.bnorm4 = nn.BatchNorm2d(256)
-
-        self.conv5_pool = torch.nn.Sequential(nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
-                                              nn.Upsample(size=(1, 1), mode='nearest'))
-        self.bnorm5 = nn.BatchNorm2d(256)
-        self.conv_last = nn.Conv2d(256, query_size[0]*query_size[1], kernel_size=1)
-
-        # activations
-        self.maxpool1 = nn.MaxPool2d(2)
-        self.maxpool2 = nn.MaxPool2d(2)
-        self.relu = nn.LeakyReLU(negative_slope=0.3)
-        self.softmax = nn.Softmax(dim=-1)
-
-        self.dropout = nn.Dropout(0.1)
-        # self.register_buffer('pos_enc', self.positionalencoding2d(4, 128, 128, 1))
-
-    def encode(self, x):
-        x = self.relu(self.bnorm1(self.conv1(x)))
-        x = self.maxpool1(self.relu(self.bnorm2(self.conv2(x))))
-        x = self.relu(self.bnorm3(self.conv3(x)))
-        x = self.maxpool2(self.relu(self.bnorm4(self.conv4(x))))
-        x = self.relu(self.bnorm5(self.conv5_pool(x)))
-        return x
-
-    def decode(self, x):
-        return self.conv_last(x)
-
-    def update_tau(self, tau):
-        self.tau = tau
-
-    def embed_code(self, embed_id):
-        return F.embedding(embed_id, self.embed.transpose(0, 1))
-
-    def positionalencoding2d(self, d_model, height, width, batch=1):
-        """
-        :param d_model: dimension of the model
-        :param height: height of the positions
-        :param width: width of the positions
-        :return: d_model*height*width position matrix
-        """
-        if d_model % 4 != 0:
-            raise ValueError("Cannot use sin/cos positional encoding with "
-                             "odd dimension (got dim={:d})".format(d_model))
-        pe = torch.zeros(d_model, height, width)
-        # Each dimension use half of d_model
-        d_model = int(d_model / 2)
-        div_term = torch.exp(torch.arange(0., d_model, 2) *
-                             -(math.log(10000.0) / d_model))
-        pos_w = torch.arange(0., width).unsqueeze(1)
-        pos_h = torch.arange(0., height).unsqueeze(1)
-        pe[0:d_model:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
-        pe[1:d_model:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
-        pe[d_model::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
-        pe[d_model + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
-        pe = pe.unsqueeze(0)#.repeat_interleave(batch, dim=0)
-        return pe
-
-    def forward(self, x, mask, return_attn=False):
-        device = x.device
-
-        # x = x[:, :1]
-        # x = torch.cat([self.pos_enc.repeat_interleave(x.shape[0], dim=0), x], dim=1)
-
-        # TODO: Add positional encoding.
-        x = self.encode(x)
-        x = self.decode(x)
-
-        query_logits_pre = x.view(x.shape[0], -1)
-        query_mask = torch.where(mask == 1, -1e9, 0.) # TODO: Check why.
-        query_logits = query_logits_pre + query_mask.to(device)
-
-        # straight through softmax
-        query = self.softmax((query_logits) / self.tau)
-
-        # TODO: Dropout?
-
-        if return_attn:
-            query = self.dropout(query)
-            _, max_ind = (query).max(1)
-            query_onehot = F.one_hot(max_ind, query.shape[1]).type(query.dtype)
-            query_out = (query_onehot - query).detach() + query
-            query_logits_pre = query_logits_pre - torch.min(query_logits_pre, dim=1, keepdim=True)[0]
-            query_logits_pre = query_logits_pre / torch.max(query_logits_pre, dim=1, keepdim=True)[0]
-            return query_out, query_logits_pre
-        else: query_out = query
-        return query_out
 
 if __name__ == '__main__':
 

@@ -11,7 +11,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import random_split, DataLoader
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.cuda.amp import autocast, GradScaler
 
@@ -212,8 +212,9 @@ def imagen_sample_in_chunks(fn):
 
 def restore_parts(state_dict_target, state_dict_from):
     for name, param in state_dict_from.items():
-
+        # print(f"name {name}")
         if name not in state_dict_target:
+            # print(f"Not loaded: {name}")
             continue
 
         if param.size() == state_dict_target[name].size():
@@ -243,7 +244,7 @@ class ImagenTrainer(nn.Module):
         only_train_unet_number = None,
         fp16 = False,
         precision = None,
-        split_batches = True,
+        split_batches = False, # TODO: modified, used to be True
         dl_tuple_output_keywords_names = ('images', 'text_embeds', 'text_masks', 'cond_images'),
         verbose = True,
         split_valid_fraction = 0.025,
@@ -254,6 +255,7 @@ class ImagenTrainer(nn.Module):
         checkpoint_fs = None,
         fs_kwargs: dict = None,
         max_checkpoints_keep = 20,
+        args = None,
         **kwargs
     ):
         super().__init__()
@@ -261,6 +263,8 @@ class ImagenTrainer(nn.Module):
         assert exists(imagen) ^ exists(imagen_checkpoint_path), 'either imagen instance is passed into the trainer, or a checkpoint path that contains the imagen config'
 
         # determine filesystem, using fsspec, for saving to local filesystem or cloud
+        if args is not None:
+            self.args = args
 
         self.fs = checkpoint_fs
 
@@ -340,8 +344,27 @@ class ImagenTrainer(nn.Module):
                 lr = unet_lr,
                 eps = unet_eps,
                 betas = (beta1, beta2),
+                # amsgrad=True,
                 **kwargs
             )
+            # optimizer = AdamW(
+            #     unet.parameters(),
+            #     lr = unet_lr,
+            #     eps = unet_eps,
+            #     betas = (beta1, beta2),
+            #     # amsgrad=True,
+            #     **kwargs
+            # )
+            # TODO: if there's no querier, do otherwise.
+            # optimizer = Adam(
+            #     [{"params": [parameter for parameter_name, parameter in unet.named_parameters()
+            #                  if "querier" not in parameter_name]},
+            #      {"params": unet.querier.parameters(), "lr": 1e-5}],
+            # lr = unet_lr,
+            # eps = unet_eps,
+            # betas = (beta1, beta2),
+            # ** kwargs
+            # )
 
             if self.use_ema:
                 self.ema_unets.append(EMA(unet, **ema_kwargs))
@@ -440,6 +463,14 @@ class ImagenTrainer(nn.Module):
 
         return optim.param_groups[0]['lr']
 
+    def set_param(self, unet_number, param_name, param_value, ema=False):
+        self.validate_unet_number(unet_number)
+        unet_index = unet_number - 1
+
+        optim = getattr(self, f'optim{unet_index}')
+        setattr(self, param_name, param_value)
+
+        return optim.param_groups[0]['lr']
     # function for allowing only one unet from being trained at a time
 
     def validate_and_set_unet_being_trained(self, unet_number = None):
@@ -604,6 +635,15 @@ class ImagenTrainer(nn.Module):
         dict_out.update({'loss': loss})
         return dict_out
 
+    # def scan_step(self, unet_number = None, **kwargs):
+    #     if not self.prepared:
+    #         self.prepare()
+    #     self.create_train_iter()
+    #     loss = self.step_with_dl_scan(self.train_dl_iter, unet_number = unet_number, **kwargs)
+    #     dict_out = self.update(unet_number = unet_number)
+    #     dict_out.update({'loss': loss})
+    #     return dict_out
+
     @torch.no_grad()
     @eval_decorator
     def valid_step(self, **kwargs):
@@ -620,6 +660,12 @@ class ImagenTrainer(nn.Module):
         model_input = dict(list(zip(self.dl_tuple_output_keywords_names, dl_tuple_output)))
         loss = self.forward(**{**kwargs, **model_input})
         return loss
+
+    # def step_with_dl_scan(self, dl_iter, **kwargs):
+    #     dl_tuple_output = cast_tuple(next(dl_iter))
+    #     model_input = dict(list(zip(self.dl_tuple_output_keywords_names, dl_tuple_output)))
+    #     loss = self.forward_scan(**{**kwargs, **model_input})
+    #     return loss
 
     # checkpointing functions
 
@@ -765,29 +811,34 @@ class ImagenTrainer(nn.Module):
 
         self.steps.copy_(loaded_obj['steps'])
 
+        print('I removed the loading of scheduler and optimizers')
+
+        # if False:
         for ind in range(0, self.num_unets):
             scaler_key = f'scaler{ind}'
             optimizer_key = f'optim{ind}'
             scheduler_key = f'scheduler{ind}'
             warmup_scheduler_key = f'warmup{ind}'
 
-            scaler = getattr(self, scaler_key)
-            optimizer = getattr(self, optimizer_key)
-            scheduler = getattr(self, scheduler_key)
-            warmup_scheduler = getattr(self, warmup_scheduler_key)
+            if not self.args.restart_training:
+                scaler = getattr(self, scaler_key)
+                optimizer = getattr(self, optimizer_key)
+                scheduler = getattr(self, scheduler_key)
+                warmup_scheduler = getattr(self, warmup_scheduler_key)
 
-            if exists(scheduler) and scheduler_key in loaded_obj:
-                scheduler.load_state_dict(loaded_obj[scheduler_key])
+                # print('Not loading optimizer and scheduler. Unet must be frozen.')
+                if exists(scheduler) and scheduler_key in loaded_obj:
+                    scheduler.load_state_dict(loaded_obj[scheduler_key])
 
-            if exists(warmup_scheduler) and warmup_scheduler_key in loaded_obj:
-                warmup_scheduler.load_state_dict(loaded_obj[warmup_scheduler_key])
+                if exists(warmup_scheduler) and warmup_scheduler_key in loaded_obj:
+                    warmup_scheduler.load_state_dict(loaded_obj[warmup_scheduler_key])
 
-            if exists(optimizer):
-                try:
-                    optimizer.load_state_dict(loaded_obj[optimizer_key])
-                    scaler.load_state_dict(loaded_obj[scaler_key])
-                except:
-                    self.print('could not load optimizer and scaler, possibly because you have turned on mixed precision training since the last run. resuming with new optimizer and scalers')
+                if exists(optimizer):
+                    try:
+                        optimizer.load_state_dict(loaded_obj[optimizer_key])
+                        scaler.load_state_dict(loaded_obj[scaler_key])
+                    except:
+                        self.print('could not load optimizer and scaler, possibly because you have turned on mixed precision training since the last run. resuming with new optimizer and scalers')
 
         if self.use_ema:
             assert 'ema' in loaded_obj
@@ -916,10 +967,11 @@ class ImagenTrainer(nn.Module):
         grads = {}
 
         if np.random.random() < 0.1:
-            grads.update({'Unet Grads': utils.get_grad_norm(self.imagen.unets[0])})
+            # grads.update({'Unet Grads': utils.get_grad_norm(self.imagen.unets[0])})
 
             if hasattr(self.imagen.unets[0], 'querier'):
                 grads.update({'Querier Grads': utils.get_grad_norm(self.imagen.unets[0].querier)})
+                grads.update({'1st Layer Querier Grads': utils.get_grad_norm(self.imagen.unets[0].querier, 'conv1.weight')})
             if hasattr(self.imagen.unets[0], 'query_encoder'):
                 grads.update({'Query Encoder Grads': utils.get_grad_norm(self.imagen.unets[0].query_encoder)})
         optimizer.zero_grad()
@@ -994,6 +1046,32 @@ class ImagenTrainer(nn.Module):
 
         return total_loss
 
+    # def forward_scan(
+    #     self,
+    #     *args,
+    #     unet_number = None,
+    #     max_batch_size = None,
+    #     **kwargs
+    # ):
+    #     unet_number = self.validate_unet_number(unet_number)
+    #     self.validate_and_set_unet_being_trained(unet_number)
+    #     self.set_accelerator_scaler(unet_number)
+    #
+    #     assert not exists(self.only_train_unet_number) or self.only_train_unet_number == unet_number, f'you can only train unet #{self.only_train_unet_number}'
+    #
+    #     total_loss = 0.
+    #
+    #     for chunk_size_frac, (chunked_args, chunked_kwargs) in split_args_and_kwargs(*args, split_size = max_batch_size, **kwargs):
+    #         with self.accelerator.autocast():
+    #             loss = self.imagen.scan(*chunked_args, unet = self.unet_being_trained, unet_number = unet_number, **chunked_kwargs)
+    #             loss = loss * chunk_size_frac
+    #
+    #         total_loss += loss.item()
+    #
+    #         if self.training:
+    #             self.accelerator.backward(loss)
+    #
+    #     return total_loss
 def simplex(t: torch.Tensor, axis=1) -> bool:
     """
     check if the matrix is the probability distribution
