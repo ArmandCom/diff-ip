@@ -42,7 +42,7 @@ def parseargs():
     parser.add_argument('--tail', type=str, default='', help='tail message')
     parser.add_argument('--ckpt_path', type=str, default=None, help='load checkpoint')
     parser.add_argument('--save_dir', type=str, default='./saved/', help='save directory')
-    parser.add_argument('--run_name', type=str, default='diff_mnist_mix', help='save directory') #'diff_mnist_mix'
+    parser.add_argument('--run_name', type=str, default='diff_mnist_mix_2', help='save directory') #'diff_mnist_mix'
     parser.add_argument('--data_dir', type=str, default='./data/', help='save directory')
     parser.add_argument('--num_viz', type=int, default=3)
     parser.add_argument('--cfg_scale', type=float, default=0)
@@ -275,7 +275,7 @@ def main(args):
 
 if __name__ == '__main__':
     args = parseargs()
-    os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu_id
+    # os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu_id
 
     main(args)
 

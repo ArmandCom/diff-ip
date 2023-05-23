@@ -278,7 +278,7 @@ def main(args):
 
 if __name__ == '__main__':
     args = parseargs()
-    os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu_id
+    # os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu_id
 
     main(args)
 

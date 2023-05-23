@@ -171,7 +171,7 @@ def main(args):
         testset = Clevr(args.data_dir, split='test', transform=transform)
 
     if args.experiment_type == 'patches-LAION':
-        patch_size = 5
+        patch_size = 8
         H = W = 64
         qh = qw = H - patch_size + 1
         cond_images_channels = C
@@ -202,14 +202,14 @@ def main(args):
         # )
 
     if args.experiment_type == 'patches-Clevr-masks':
-        patch_size = 1 #1 #5
-        H = W = 64
+        patch_size = 5 # 7
+        H = W = 128 # 64
         qh = qw = H - patch_size + 1
         # C = 1
         cond_images_channels = 1
         layer_cross_attns = (False, False, False, False)
-        args.max_queries_random = 1000 #3000
-        args.max_queries_biased = 50
+        args.max_queries_random = 100 #3000
+        args.max_queries_biased = 100
         attr_size = max_num_attributes = max_num_objects = None
         use_attr = cond_on_text = False
         dl_keynames = ('images', 'cond_images')
@@ -394,7 +394,7 @@ def main(args):
     trainer.imagen.unets[0].args = args
     trainer.imagen.unets[0].querier.tau = tau_vals[load_epoch]
 
-    def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, num_samples_total=4, max_samples_batch=5, epoch=0, max_query=100, log=False, full_queries=False, save_name='', random=False):
+    def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, num_samples_total=4, max_samples_batch=5, epoch=0, max_query=100, log=False, full_queries=False, save_name='', random='n'):
         total_sampled = 0
         iterable = enumerate(testloader)
         while total_sampled < num_samples_total:
@@ -512,12 +512,12 @@ def main(args):
 
             for i in range(num_queries):
 
-
                 if args.experiment_type.startswith('patches'):
-
                     plot_cond = masked_x.clone()
-                    queried_patches.append(plot_cond)
-
+                    if args.experiment_type == 'patches-LAION':
+                        if i % 10 == 0:
+                            queried_patches.append(plot_cond.cpu()) # TODO: restrict to sample_ids + 20 or a minimum of 100 queries.
+                    else: queried_patches.append(plot_cond.cpu())
                     if i in sample_ids:
                         if num_samples > 0:
                             minibatch_list = []
@@ -533,7 +533,7 @@ def main(args):
                                 minibatch_list.append(images.cpu())
                             sampled_im_list.append(torch.stack(minibatch_list, dim=1))
 
-                    if random:
+                    if random == 'y':
                         query_vec = torch.zeros_like(mask)
                         if histories is None:
                             histories = ops.random_sampling(mask.size(1), mask.size(1), mask.size(0), exact=True, return_ids=True)
@@ -546,7 +546,20 @@ def main(args):
                             histories = histories[:, 1:]
                         # masked_x, S_v, S_ij, split = ops.get_patch_mask(mask, input_cond, patch_size=patch_size,
                         #                                                 null_val=args.null_val)
-
+                    elif random == 'prior':
+                        query_vec = torch.zeros_like(mask)
+                        if histories is None:
+                            histories = ops.random_sampling_w_prior(mask.size(1), mask.size(1), mask.size(0), exact=True, return_ids=True, case='patches', wh = None)
+                            # random_sampling(mask.size(1), mask.size(1), mask.size(0), exact=True, return_ids=True)
+                            # histories = ops.random_sampling_withprior(mask.size(1), mask.size(1), mask.size(0), exact=True, return_ids=True, case=args.experiment_type)
+                            histories = histories.to(device)
+                            # print(histories.shape, histories)
+                        query_vec.scatter_(1, histories[:, :1],
+                                                          torch.ones_like(query_vec))
+                        if histories.shape[1] > 1:
+                            histories = histories[:, 1:]
+                        # masked_x, S_v, S_ij, split = ops.get_patch_mask(mask, input_cond, patch_size=patch_size,
+                        #                                                 null_val=args.null_val)
                     else:
                         with torch.no_grad():
                             if args.include_gt:
@@ -555,7 +568,12 @@ def main(args):
                                 querier_inputs = masked_x.to(device)
                             query_vec, query_soft, attn = querier(querier_inputs, mask, return_attn=True)
                             attn_plot = attn.reshape(N, 1, qw, qh).clone().cpu()
-                            attn_list.append(attn_plot)
+                            if args.experiment_type.startswith('patches'):
+                                if args.experiment_type == 'patches-LAION':
+                                    if i % 10 == 0:
+                                        attn_list.append(attn_plot)
+                                else:
+                                    attn_list.append(attn_plot)
 
                     mask[torch.arange(N), query_vec.argmax(dim=1)] = 1.0 # TODO: Solve problem here
                     masked_x = ops.update_masked_image(masked_x, input_cond, query_vec, patch_size=patch_size)
@@ -570,7 +588,7 @@ def main(args):
                     in_ans = torch.stack([ans_pos, ans_neg], dim=-1)
                     input_x = input_x.to(device)
 
-                    if random:
+                    if random == 'y':
                         q_new_flat = torch.zeros_like(q_mask.flatten(1,2))
                         q_soft_flat = q_new_flat
                         if histories is None:
@@ -580,10 +598,12 @@ def main(args):
                             # batch_ids = torch.arange(q_mask.shape[0]).type(torch.LongTensor).to(device)
                         # q_new_flat[batch_ids, histories[batch_ids, 0]] =  1
                         q_new_flat.scatter_(1, histories[:, :1], torch.ones_like(q_new_flat))
+                        q_new_flat = q_new_flat[..., None]
 
                         if histories.shape[1] > 1:
                             histories = histories[:, 1:]
-
+                    elif random == 'prior':
+                        raise NotImplementedError
                         # TODO: where are the answers? ALSO CHECK: are the answers being updated in the main code for the randomly selected queries?
                     else:
                         with torch.no_grad():
@@ -616,8 +636,9 @@ def main(args):
                             answer_queries(q_new, gt_attrs_rem, ans_all)
                     else: ans_all = gt_attrs_rem
                     q_new_hard = q_new_flat.reshape(N, max_num_attributes, max_num_objects)
-                    ans_new = ans_all * q_new_flat[..., None]
-                    ans_new_hard = ans_all * q_new_flat[..., None]
+                    # print(ans_all.shape, q_new_flat[..., None].shape)
+                    ans_new = ans_all * q_new_flat
+                    ans_new_hard = ans_all * q_new_flat
 
                     chosen_attr = []
                     # TODO: make sure the +1 makes sense
@@ -690,7 +711,7 @@ def main(args):
                                 sampl_im.numpy())
 
                 if len(attn_list)>0:
-                    utils.log_images(torch.stack(attn_list, dim=1).flatten(0,1), wandb, name='Q_attention', range=(0,1), nrow=num_queries)
+                    # utils.log_images(torch.stack(attn_list, dim=1).flatten(0,1), wandb, name='Q_attention', range=(0,1), nrow=num_queries)
                     # utils.log_images(torch.cat(attn_list, dim=0), wandb, name='Q_attention', range=(0,1), nrow=num_queries)
                     # np.save('attn.npy', torch.cat(attn_list, dim=0).numpy())
 
@@ -724,15 +745,15 @@ def main(args):
                                 ans_all.cpu().numpy())
 
                 if len(queried_patches)>0:
-                    utils.log_images(torch.stack(queried_patches, dim=1).flatten(0,1), wandb,
-                                     name='S', range=(-1,1), nrow=num_queries)
+                    # utils.log_images(torch.stack(queried_patches, dim=1).flatten(0,1), wandb,
+                    #                  name='S', range=(-1,1), nrow=num_queries)
 
                     if args.save_data:
                         sampl = torch.stack(queried_patches, dim=1).reshape(N, -1, len(queried_patches),
                                                                           *queried_patches[0].shape[1:])
                         np.save(
                             f"/cis/home/acomas/data/samples_{save_name}/queried_{total_sampled - N}-{total_sampled}.npy",
-                            sampl.cpu().numpy())
+                            sampl.numpy())
 
     def sample_with_gt(trainer, num_samples=1, cond_scale=3., epoch=0, log=True):
 
@@ -767,20 +788,24 @@ def main(args):
     # Test
     if args.test:
         if args.random_baseline:
-            cases = ['loaded', 'random']#, 'loaded'] # Random must come last
-        else: cases = ['loaded']
+            cases = ['prior']  #, 'prior'] #]#, 'loaded'] # Random must come last
+        else: cases = ['normal'] #raise NotImplementedError # case = ['normal']
         for case in cases:
+            # print(case)
             if case == 'random':
                 print('\n\nRandom Baseline: ')
-                random_baseline, save_name = True, args.name + '_random'
+                random_baseline, save_name = 'y', args.name + '_random'
+            elif case == 'prior':
+                print('\n\nRandom Baseline with prior: ')
+                random_baseline, save_name = 'prior', args.name + '_prior'
             else: random_baseline, save_name = False, args.name
             sample_ids = args.sample_ids #[0, 5, 10] #[0, 2, 5, 10, 15, -1] #Shape: [0, 2, 5, 10, 15, -1];  Color: [0, 5, 10, 20, 30, -1] #, 10, 30]
-            num_samples_total = 120 #batch_size_test * 3 #30
+            num_samples_total = 120 #120 #batch_size_test * 3 #30
             sample_with_querier(trainer, sample_ids=sample_ids,
                                 num_samples=args.num_samples,
                                 num_samples_total=num_samples_total,
                                 max_samples_batch=5,
-                                num_queries=all_queries, epoch=load_epoch, #
+                                num_queries=all_queries+1, epoch=load_epoch, #
                                 log=True, full_queries=False, random=random_baseline, save_name = save_name)
         if args.all_queries:
             # TODO: implement num_samples to be sampled in parallel.
@@ -813,7 +838,7 @@ def main(args):
             dict_out = trainer.train_step(unet_number=1, max_batch_size=100)
             wandb.log(dict_out)
         print('Epoch {}/{} done.'.format(epoch+1, args.epochs))
-        save_interval = 5 if epoch > load_epoch + 100 else 20
+        save_interval = 5 if epoch > load_epoch + 100 else 10
         if (epoch % save_interval == 0 or epoch == args.epochs - 1) and epoch > load_epoch:
             print('Save ckpt')
             trainer.save(os.path.join(model_dir_ckpt, 'ckpt', f'epoch{epoch}.pt'))

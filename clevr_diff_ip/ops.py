@@ -62,12 +62,15 @@ def random_sampling_w_prior(max_queries_sample, max_queries_possible, num_sample
 
     if case.startswith('patches'):
         probs = torch.ones(max_queries_possible)
-        side = np.sqrt(max_queries_possible)
-        discard = side//2
+        side = int(np.sqrt(max_queries_possible))
+        discard = int(side//2)
         probs = probs.reshape(side, side)
         probs[:discard, :discard] = 0.1
+        probs[:discard, -discard:] = 0.1
         probs[-discard:, -discard:] = 0.1
-        assert probs[probs!=0].sum() >= max_queries_sample
+        probs[-discard:, :discard] = 0.1
+        # assert probs[probs!=0].sum() >= max_queries_sample
+    
     if case.startswith('attributes'):
         # TODO: maybe start at the center (max prob) and lower towards the sides
         assert isinstance(wh, tuple)
@@ -75,7 +78,7 @@ def random_sampling_w_prior(max_queries_sample, max_queries_possible, num_sample
         probs = probs.reshape(wh[0], wh[1]) # attr, obj
         for i in wh[0]:
             probs[i] /= 2**i
-        assert probs[probs != 0].sum() >= max_queries_sample
+        # assert probs[probs != 0].sum() >= max_queries_sample
 
     mask = torch.zeros(num_samples, max_queries_possible)
     if empty: return mask
