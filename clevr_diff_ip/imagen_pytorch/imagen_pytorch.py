@@ -1662,6 +1662,8 @@ class Unet(nn.Module):
         aux_outputs = {}
         # condition on self
         # print(x)
+
+        # Ignore
         if self.self_cond:
             self_cond = default(self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x, self_cond), dim = 1)
@@ -1680,13 +1682,14 @@ class Unet(nn.Module):
 
 
         query_soft = None
+        # Case where our query set has the shape of an image (patches).
         if exists(cond_images) and not exists(text_embeds):
             N = cond_images.shape[0]
             PATCH_SIZE = self.patch_size
             QUERY_ALL = (self.image_size[0] - PATCH_SIZE + 1) ** 2
             MAX_RAND_QUERIES = self.args.max_queries_random
             NULL_VAL = self.null_val
-            if self.cond_images_channels == 1:
+            if self.cond_images_channels == 1: # 1 channel (MNIST)
 
                 # assert cond_images.shape[1] == self.cond_images_channels, 'the number of channels on the conditioning image you are passing in does not match what you specified on initialiation of the unet'
                 cond_images = resize_image_to(cond_images, self.cond_img_size)
@@ -1695,11 +1698,11 @@ class Unet(nn.Module):
 
                 # initial random sampling
                 if self.args.train_querier and not self.args.all_queries:
-                    rand, th, init_zeros = random(), 0.2, True
-                    # gt_input = cond_images
+                    rand, th, init_zeros = random(), 0.2, True # Th is the probability of sampling randomly even if we have chosen a biased strategy
+                    # Init zeros indicates whether we start sampling queries from scratch or from a randomly chosen set.
                     gt_input = cond_images
                     gt_input = cond_rgb if self.channels == 3 else cond_masks
-                    if self.sampling == 'biased' and rand > th:
+                    if self.sampling == 'biased' and rand > th: # biased sampling
                         num_queries = torch.randint(low=0, high=self.args.max_queries_biased, size=(1,))
                         # # mask, masked_x = ops.adaptive_sampling(x, num_queries, self.querier, PATCH_SIZE, QUERY_ALL)
                         if init_zeros:
@@ -1720,26 +1723,28 @@ class Unet(nn.Module):
                         with torch.no_grad():
                             masked_x, mask = self.biased_sampling(gt_input, cond_masks, num_queries, masked_x, mask, patch_size=PATCH_SIZE)
 
-                        # two backwards
+                        # two backwards: Optional
                         # masked_x, mask = self.biased_sampling(gt_input, cond_masks, 1, masked_x, mask, patch_size=PATCH_SIZE)
                     elif self.sampling == 'random' or rand <= th:
-                        empty = random() < 0.01
+                        empty = random() < 0.01 # We give higher probability to N=0 (as a warmup often)
                         mask = ops.random_sampling(MAX_RAND_QUERIES, QUERY_ALL, x.size(0), empty=empty).to(device)
-                        masked_x, S_v, S_ij, split = ops.get_patch_mask(mask, cond_masks, patch_size=PATCH_SIZE, null_val=NULL_VAL)
+                        masked_x, S_v, S_ij, split = ops.get_patch_mask(mask, cond_masks, patch_size=PATCH_SIZE, null_val=NULL_VAL) # masked_x are the set of chosen queries and answers
 
+                    # Create input to the querier (include or exclude gt)
                     if self.include_gt:
                         querier_inputs = torch.cat([masked_x, gt_input], dim=1).to(device)
                     else: querier_inputs = masked_x
+
                     query_vec, query_soft = self.querier(querier_inputs.contiguous(), mask.contiguous())
                     # # NOTE I JUST SELECTED PATCH WITH QUERY_SOFT
                     # query_vec = query_soft
-                    masked_x = ops.update_masked_image(masked_x, cond_masks, query_vec, patch_size=PATCH_SIZE)
+                    masked_x = ops.update_masked_image(masked_x, cond_masks, query_vec, patch_size=PATCH_SIZE) # update mask
                 else:
                     masked_x = cond_masks
                 aux_outputs['masked_x'] = masked_x
                 # masked_x = resize_image_to(masked_x, x.shape[-1])
 
-            elif self.cond_images_channels == 3:
+            elif self.cond_images_channels == 3: # Queries have 3 channels (e.g. CelebA)
                 # TODO:
                 #  write sampling code,
                 #  implement zeroing out of the image with drop prob.
@@ -1752,12 +1757,12 @@ class Unet(nn.Module):
                 N = cond_images.shape[0]
                 num_queries = (self.image_size[0] - self.patch_size + 1) ** 2
 
-                # initial random sampling
-                if self.args.train_querier and not self.args.all_queries:
+                # initial random sampling (same as above, should factorize the code)
+                if self.args.train_querier and not self.args.all_queries: # If all_queries there is no query selection
                     rand, th, init_zeros = random(), 0.1, True
                     # gt_input = cond_images
                     gt_input = cond_rgb
-                    if self.sampling == 'biased' and rand > th:
+                    if self.sampling == 'biased' and rand > th: # biased sampling
                         max_queries_biased = self.args.max_queries_biased
                         num_queries = torch.randint(low=0, high=max_queries_biased, size=(1,))
                         # # mask, masked_x = ops.adaptive_sampling(x, num_queries, self.querier, PATCH_SIZE, QUERY_ALL)
@@ -1792,20 +1797,23 @@ class Unet(nn.Module):
                     masked_x = cond_rgb # If training is false, this will be directly the masked_x
 
                 masked_x = resize_image_to(masked_x, x.shape[-1])
+
+            # Here we concatenate the noisy input (x) with the query_set and answers (masked_x) as the input to our denoiser
             x = torch.cat((masked_x, x), dim=1)
 
-            # # ORTH LOSS - Cross Entropy
+            # # ORTH LOSS - Cross Entropy. Handcrafted at the moment, unused in this case.
             # if exists(query_soft):
             #     loss_orth = loss_orth_fn(query_soft)
             #     alpha = 1e-3
-            #     aux_losses = {'loss_orth': (alpha, loss_orth)}
+            #     aux_lossessses = {'loss_orth': (alpha, loss_orth)}
 
         # initial convolution
-        # self.encode_clean_features = False
+        # We can use part of the downsampling layers of the UNet to extract features from the querier input.
         if self.encode_clean_features and x_start is not None:
             x = torch.cat([x, x_start], dim=0) # use clean data too to guide querier
             time = torch.cat([time, torch.zeros_like(time)], dim=0)
 
+        ## Here, the UNet feature extraction starts
         x = self.init_conv(x) # [16, 32, 128, 128]
         # init conv residual
 
@@ -1863,31 +1871,33 @@ class Unet(nn.Module):
         c_mask = None
 
         # Note: Attribute embeddings
+        # In case of attribute-like querysets, this is where they are processed.
         if exists(text_embeds):
             histories = None
             cond_att, ans_att = None, None
             # cond_images = cond_images
             if len(text_embeds.shape) == 4:
+            # This is for sampling, where queries and answers are selected outside of the model and given to the model for sampling.
+            # It is important to provide the queries in the expected format (as currently implemented in main_clevr.py)
                 sampling = True
                 cond_pos, cond_neg = text_embeds[..., :-1, 0], text_embeds[..., :-1, 1]
                 ans_pos, ans_neg = text_embeds[..., -1:, 0], text_embeds[..., -1:, 1]
                 if text_embeds.shape[-1] == 3:
                     cond_unasked, ans_unasked = text_embeds[..., :-1, 2], text_embeds[..., -1:, 2]
                 cond_att, ans_att = None, None
-            else:
+            else: # Instead, during training, we sample a history and then run the querier once more.
                 sampling = False
                 attrs = text_embeds
 
                 max_prob = 0.99
-                if self.args.all_queries or (not self.args.train_querier and np.random.random() > 1-0.01): # All queries in 10% of the cases
+                if self.args.all_queries or (not self.args.train_querier and np.random.random() > 1-0.01): # All queries answered for evaluating generative model.
                     prob_ask = 1 # Select for test.
                     exact = True
-                    # print('a', prob_ask)
                 else:
                     prob_ask = np.random.uniform(0, max_prob)
                     exact = False
-                    # print('b', prob_ask)
-                # prob_ask = 1 # Select for test.
+
+                # Mask of selected queries
                 q_mask = torch.ones((batch_size, self.max_num_attributes, self.max_num_objects),
                                     device=text_embeds.device, dtype=attrs.dtype)
                 q_mask_bool = prob_mask_like((batch_size, self.max_num_attributes, self.max_num_objects), prob_ask,
@@ -1896,6 +1906,7 @@ class Unet(nn.Module):
                 q_all = torch.linspace(1, self.max_num_attributes, self.max_num_attributes, device=text_embeds.device,
                                        dtype=attrs.dtype)[None, :, None]
                 q = (q_mask * q_all).reshape(batch_size, -1)
+
 
                 # Get embeddings for all queries
                 attr_embeds = self.cond_embedding(q)
@@ -1911,14 +1922,18 @@ class Unet(nn.Module):
                     ans_all = attrs
 
                 ans = ans_all * q_mask.reshape(*ans_all.shape)
+
                 # Select the asked queries in their embeddings according to the answers.
+                # We will have a different set of embeddings for positive answers, negative answers and unasked quersions.
                 ans_neg = torch.zeros_like(ans)
                 ans_pos = torch.zeros_like(ans)
                 ans_unasked = torch.zeros_like(ans)
 
+                # Provide answers
                 ans_neg[ans == -1] = 1
                 ans_pos[ans == 1] = 1
                 ans_unasked[ans == 0] = 1
+
 
                 cond_pos_all, cond_neg_all, cond_unasked_all = (attr_embeds), \
                     (attr_embeds_neg ), (zero_embed )
@@ -1932,6 +1947,7 @@ class Unet(nn.Module):
                 if self.args.all_queries:
                     cond_pos, cond_neg, cond_unasked = cond_pos_all * ans_pos, cond_neg_all * ans_neg, cond_unasked_all * ans_unasked
 
+                # Randomly sample query history
                 elif self.sampling == 'random' or rand < th: #Random 20% of the times
 
                     # Randomly sample queries with probability prob_ask: [either 1 or [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
@@ -1946,7 +1962,7 @@ class Unet(nn.Module):
                     cond_pos, cond_neg = [c * q_mask.reshape(*ans_all.shape) * a for c, a in
                                                         zip((cond_pos_all, cond_neg_all),
                                                             (ans_pos, ans_neg))]
-
+                # Sample history with a biased strategy.
                 elif self.sampling == 'biased':
 
                     # Randomly sample queries with probability prob_ask: [either 1 or [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
@@ -1971,13 +1987,17 @@ class Unet(nn.Module):
 
                             out_query_features = None
                             if self.encode_query_features:
+                                # Encode attribute embeddings into features.
                                 attr_embeds_ = self.query_encoder(cond=(cond_pos, cond_neg),
                                                                   ans=(ans_pos, ans_neg),
                                                                   cond_att=cond_att,
                                                                   ans_att=ans_att)
                                 # attr_tokens_ = self.to_text_non_attn_cond(attr_embeds_)
+
+
                                 out_query_features = self.process_tokens(attr_embeds_)
 
+                            # call the querier
                             q_new, q_soft, attn = self.querier(cond=in_embeds, ans=in_ans, image=cond_images, image_features=out_clean_features,
                                                        query_features=out_query_features, mask=q_mask.reshape(batch_size, -1), cond_all=in_embeds_all,
                                                        return_attn=True)
@@ -1994,12 +2014,13 @@ class Unet(nn.Module):
                             else:
                                 ans_all = attrs
 
+                            # Get new answer
                             ans_new = ans_all * q_new
                             # select the asked queries in their embeddings according to the answers.
 
                             bool_pos, bool_neg = (ans_new > 0), (ans_new < 0)
 
-
+                            # Get new mask
                             q_mask = torch.clamp(q_new + q_mask.reshape(*q_new.shape), 0, 1)
 
                             # select the asked queries in their embeddings according to the answers.
@@ -2015,12 +2036,13 @@ class Unet(nn.Module):
                 else: raise NotImplementedError
 
 
-
                 # Get new query with gradients.
                 if prob_ask < max_prob and self.args.train_querier: # TODO: Set back to true to train querier.
 
                     # Note: code to get encodings for the querier
                     out_query_features = None
+
+                    # Precompute query features (optional)
                     if self.encode_query_features:
                         with torch.no_grad():
                             attr_embeds_ = self.query_encoder(cond=(cond_pos, cond_neg),
@@ -2062,13 +2084,14 @@ class Unet(nn.Module):
 
                     # Apply orthogonality loss
 
-
+                    # Entropy loss to encourage different queries across samples.
                     loss_orth = loss_orth_fn(q_soft_flat)
                     alpha = 0.000001 # 000
                     aux_losses = {'loss_orth': (alpha, loss_orth)}
 
                     bool_pos, bool_neg = (ans_new > 0), (ans_new < 0)
 
+                    # Changes for a specific querier type that uses qkv attention.
                     if self.attention_querier:
                         ans_new_pos = torch.where(bool_pos, ans_new, torch.zeros_like(ans_pos)).sum(1, keepdims=True)
                         ans_new_neg = torch.where(bool_neg, ans_new, torch.zeros_like(ans_neg)).sum(1, keepdims=True)
@@ -2090,7 +2113,7 @@ class Unet(nn.Module):
 
                         cond_att = (cond_new_pos, cond_new_neg)
                         ans_att = (ans_new_pos, ans_new_neg)
-                    else:
+                    else: # Regular querier type (Convolutional)
 
                         q_mask = torch.clamp(q_new + q_mask.reshape(*q_new.shape), 0, 1)
 
@@ -2154,7 +2177,7 @@ class Unet(nn.Module):
             # print(ans_pos_enc[0] - ans_neg_enc[0])
             t_cond = (cond_pos, cond_neg)
             t_ans = (ans_pos_enc, ans_neg_enc)
-            if self.query_decoder:
+            if self.query_decoder: # Decode queries if we want to supervise their features through autoencoding.
                 S, S_dec, attr_embeds_enc = self.query_encoder(cond=t_cond,
                                                             ans=t_ans)
                 loss_rec = self.loss_rec(S_dec, S)
@@ -2170,19 +2193,19 @@ class Unet(nn.Module):
 
             attr_tokens = attr_embeds_enc
 
+            # This mask is applied to the cross-atention layers of the transformers in the denoising UNet.
+            # By having a mask, we simply omit the unasked quersions.
             c_mask = ((ans_neg_enc != 0).logical_or(ans_pos_enc != 0))[..., 0]
-
-
-            # print(c_mask.sum())
             if self.attention_querier and not self.args.all_queries and self.args.train_querier:
                 c_mask = F.pad(c_mask, (0, 1), value=True)
-
             # TODO: restore and check.
             c_mask = torch.where(
                 attr_keep_mask_hidden[..., 0],
                 c_mask,
                 False
             )
+
+            # Encode attributes
             attr_hiddens = self.to_text_non_attn_cond(attr_tokens)
             if len(attr_tokens.shape) == 3:
                 attr_hiddens_out = attr_hiddens.sum(1) #.sum(1) # Note: Uncomment this and switch above for flatten_attr_process_token
@@ -2190,15 +2213,14 @@ class Unet(nn.Module):
             else:
                 print('we must have more than one attribute token')
                 exit()
-            t = t #+ attr_hiddens_out
+            t = t #+ attr_hiddens_out # We do not use the pooled condition, only the cross-attention conditioning.
             # text conditioning
 
         # c = time_tokens if not exists(text_tokens) else torch.cat((time_tokens, text_tokens), dim = -2)
         c = time_tokens if not exists(text_tokens) else text_tokens
 
         # normalize conditioning tokens
-
-        # c = self.norm_cond(c) # TODO: check again
+        # c = self.norm_cond(c) # Removed condition normalization
 
         # initial resnet block (for memory efficient unet)
 
@@ -2208,6 +2230,7 @@ class Unet(nn.Module):
 
         hiddens = []
 
+        # Apply UNet layers. Compute cross attention with computed condition "c"
         for pre_downsample, init_block, resnet_blocks, attn_block, post_downsample in self.downs:
             if exists(pre_downsample):
                 x = pre_downsample(x)

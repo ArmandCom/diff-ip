@@ -151,9 +151,10 @@ def main(args):
                                     transforms.Resize(size=(H, W))
                                     ])
 
-    main_dim = 32
+    main_dim = 32 # Backbone dimension for UNet
 
-    ## Constants
+
+    ## Main experiments and associated variables.
     if args.experiment_type == 'patches-Clevr':
         patch_size = 9
         qh = qw = H - patch_size + 1
@@ -288,7 +289,7 @@ def main(args):
         trainset = Clevr_with_attr(args.data_dir, split='train', transform=transform, attribute=attribute, max_attributes=max_num_objects)
         testset = Clevr_with_attr(args.data_dir, split='test', transform=transform, attribute=attribute, max_attributes=max_num_objects)
 
-    elif args.experiment_type == 'cub':
+    elif args.experiment_type == 'cub': # Too little data to train a diffusion model. Should finetune pre-trained.
 
         patch_size = None
         max_num_attributes = 312
@@ -320,6 +321,7 @@ def main(args):
 
     iters_per_epoch = len(trainset) // args.batch_size
 
+    # Initialize UNet (check class in imagen_pytorch/imagen_pytorch.py. Most important code is there)
     unet1 = Unet( # TODO: Increase dim to 128 at the expense of other hyperparams.
         dim = main_dim,
         image_size = (W, H),
@@ -342,6 +344,7 @@ def main(args):
         FLAGS = args,
     )
 
+    # Initialize diffusion model (check class in imagen_pytorch/imagen_pytorch.py)
     imagen = Imagen(
         unets = (unet1),
         image_sizes = (H),
@@ -355,6 +358,7 @@ def main(args):
         p2_loss_weight_gamma = 0.5, #0.5
     )
 
+    # Initialize trainer (check code in imagen_pytorch/trainer.py)
     trainer = ImagenTrainer(imagen,
                             warmup_steps = 1 * iters_per_epoch if not args.no_warmup else None,
                             cosine_decay_max_steps = (args.epochs - 1) * iters_per_epoch,
@@ -394,6 +398,7 @@ def main(args):
     trainer.imagen.unets[0].args = args
     trainer.imagen.unets[0].querier.tau = tau_vals[load_epoch]
 
+    # Sampling function
     def sample_with_querier(trainer, sample_ids, num_queries=5, num_samples=1, num_samples_total=4, max_samples_batch=5, epoch=0, max_query=100, log=False, full_queries=False, save_name='', random='n'):
         total_sampled = 0
         iterable = enumerate(testloader)
@@ -404,6 +409,7 @@ def main(args):
             im_list = []
             info_list = []
 
+            # Different input data for different experiments
             if args.experiment_type == 'patches-Clevr' or args.experiment_type == 'patches-CelebA':
                 _, (input_x, input_cond) = next(iterable)
                 input_x, input_cond = input_x.to(device), input_cond.to(device)
@@ -442,7 +448,7 @@ def main(args):
             total_sampled += N
             print('total sampled: ', N)
 
-            # N, device = input_x.shape[0], input_x.device
+            # Log to wandb
             if not log:
                 utils.save_images(input_x, os.path.join(model_dir_ckpt, 'GT_sample.png'), range=(-1, 1))
             else:
@@ -450,6 +456,7 @@ def main(args):
                 utils.log_images(input_x, wandb,
                                  name='GT images', range=(-1, 1), nrow=1)
 
+            # Call querier and sample queries.
             querier = trainer.imagen.unets[0].querier # Put to eval or torch nograd
             if sample_ids == 'all':
                 sample_ids = list(np.arange(num_queries))
@@ -509,6 +516,7 @@ def main(args):
             sampled_im_list = []
             attn_list = []
             ans_all = None
+
 
             for i in range(num_queries):
 
@@ -686,6 +694,7 @@ def main(args):
                     wandb.log({"Queried Attributes": text_table})
                 except: print('Chosen attributes didn\'t have the same shape.')
 
+            # Logging
             if log:
 
                 if args.save_data:
@@ -755,6 +764,7 @@ def main(args):
                             f"/cis/home/acomas/data/samples_{save_name}/queried_{total_sampled - N}-{total_sampled}.npy",
                             sampl.numpy())
 
+    # Sampling function with all queries answered (only valuable for attribute-based querysets).
     def sample_with_gt(trainer, num_samples=1, cond_scale=3., epoch=0, log=True):
 
         im_list = []
@@ -823,14 +833,19 @@ def main(args):
             if epoch % 1 == 0 and (epoch > load_epoch or args.sample_first_iter):
                 sample_ids = []
                 num_samples = 1 if epoch > 0 else 0
+
+                # Logging: Sample with ground-truth
                 if epoch % 15 == 0 and not args.experiment_type.startswith('patches'):
+                    # Note: If training gets stuck during this sampling step for reporting, just comment out these lines
                     trainer.imagen.unets[0].args.all_queries = True
                     trainer.unets[0].args.all_queries = True
                     sample_with_gt(trainer, num_samples=num_samples, cond_scale=cond_scale, epoch=load_epoch, log=True)
                     trainer.imagen.unets[0].args.all_queries = False
                     trainer.unets[0].args.all_queries = False
 
+                # Logging: Sample with querier
                 if epoch % 5 == 0 or (epoch < load_epoch + 5):
+                    # Note: If training gets stuck during this sampling step for reporting, just comment out these lines
                     sample_with_querier(trainer, sample_ids=sample_ids, num_queries=20,
                                         num_samples=num_samples, epoch=epoch, log=True)
                 wandb.log({'lr':trainer.get_lr(1)})
