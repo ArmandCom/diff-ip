@@ -30,9 +30,14 @@ import torchvision as tv
 import lovely_tensors as lt
 lt.monkey_patch()
 
-# TODO: Change directly the input to the querier when we have new answers.
+# Helpful commands
 # ps -up `nvidia-smi -q -x | grep pid | sed -e 's/<pid>//g' -e 's/<\/pid>//g' -e 's/^[[:space:]]*//'`
-# conda activate imagen; cd projects/clevr_diff_ip/; accelerate launch main_clevr_attr.py --batch_size 16 --sampling biased --test --name querier128SAUnet_S3000biased_and_unbiased_withmask_hard
+# conda activate imagen; cd projects/clevr_diff_ip/; accelerate launch main_clevr.py --batch_size 16 --sampling biased --test --name querier128SAUnet_S3000biased_and_unbiased_withmask_hard
+
+# accelerate config
+# accelerate launch ...py ---> for parallel computing.
+
+# CUDA_VISIBLE_DEVICES={} # IF not using accelerate, choose what GPU to use.
 
 def parseargs():
     parser = argparse.ArgumentParser()
