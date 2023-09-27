@@ -1,0 +1,19 @@
+DEVICE: cuda
+N Dev, Curr Dev 1 0
+ Look at the TODO list!
+The base dimension of your u-net should ideally be no smaller than 128, as recommended by a professional DDPM trainer https://nonint.com/2022/05/04/friends-dont-let-friends-train-small-diffusion-models/
+removed initial layer norm
+training with dataset of 34125 samples and validating with randomly splitted 875 samples
+Failed loading state dict. Trying partial load
+I removed the loading of scheduler and optimizers
+could not load optimizer and scaler, possibly because you have turned on mixed precision training since the last run. resuming with new optimizer and scalers
+Failed loading state dict. Trying partial load
+checkpoint loaded from /storage/changyu/results/clevr_diff_ip/attr-CelebA_diff_only/ckpt/epoch270.pt
+training with dataset of 34125 samples and validating with randomly splitted 875 samples
+270
+total sampled:  4
+unet 1 has not been trained
+when sampling, you can pass stop_at_unet_number to stop early in the cascade, so it does not try to generate with untrained unets
+Repeating samples 1 times.
+0it [00:00, ?it/s]
+

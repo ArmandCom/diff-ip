@@ -1,0 +1,28 @@
+2023-09-27 11:02:17,590 INFO    MainThread:32141 [wandb_setup.py:_flush():76] Current SDK version is 0.15.5
+2023-09-27 11:02:17,591 INFO    MainThread:32141 [wandb_setup.py:_flush():76] Configure stats pid to 32141
+2023-09-27 11:02:17,591 INFO    MainThread:32141 [wandb_setup.py:_flush():76] Loading settings from /home/changyu/.config/wandb/settings
+2023-09-27 11:02:17,591 INFO    MainThread:32141 [wandb_setup.py:_flush():76] Loading settings from /home/changyu/diff_ip_attr/wandb/settings
+2023-09-27 11:02:17,591 INFO    MainThread:32141 [wandb_setup.py:_flush():76] Loading settings from environment variables: {}
+2023-09-27 11:02:17,591 INFO    MainThread:32141 [wandb_setup.py:_flush():76] Applying setup settings: {'_disable_service': False}
+2023-09-27 11:02:17,591 INFO    MainThread:32141 [wandb_setup.py:_flush():76] Inferring run settings from compute environment: {'program_relpath': 'main_clevr.py', 'program': '/home/changyu/diff_ip_attr/main_clevr.py'}
+2023-09-27 11:02:17,591 INFO    MainThread:32141 [wandb_init.py:_log_setup():507] Logging user logs to /home/changyu/diff_ip_attr/wandb/run-20230927_110217-xwyllpto/logs/debug.log
+2023-09-27 11:02:17,591 INFO    MainThread:32141 [wandb_init.py:_log_setup():508] Logging internal logs to /home/changyu/diff_ip_attr/wandb/run-20230927_110217-xwyllpto/logs/debug-internal.log
+2023-09-27 11:02:17,592 INFO    MainThread:32141 [wandb_init.py:init():547] calling init triggers
+2023-09-27 11:02:17,592 INFO    MainThread:32141 [wandb_init.py:init():554] wandb.init called with sweep_config: {}
+config: {}
+2023-09-27 11:02:17,592 INFO    MainThread:32141 [wandb_init.py:init():596] starting backend
+2023-09-27 11:02:17,592 INFO    MainThread:32141 [wandb_init.py:init():600] setting up manager
+2023-09-27 11:02:17,595 INFO    MainThread:32141 [backend.py:_multiprocessing_setup():106] multiprocessing start_methods=fork,spawn,forkserver, using: spawn
+2023-09-27 11:02:17,599 INFO    MainThread:32141 [wandb_init.py:init():606] backend started and connected
+2023-09-27 11:02:17,603 INFO    MainThread:32141 [wandb_init.py:init():705] updated telemetry
+2023-09-27 11:02:17,604 INFO    MainThread:32141 [wandb_init.py:init():738] communicating run to backend with 60.0 second timeout
+2023-09-27 11:02:18,005 INFO    MainThread:32141 [wandb_run.py:_on_init():2173] communicating current version
+2023-09-27 11:02:18,105 INFO    MainThread:32141 [wandb_run.py:_on_init():2182] got version response upgrade_message: "wandb version 0.15.11 is available!  To upgrade, please run:\n $ pip install wandb --upgrade"
+
+2023-09-27 11:02:18,106 INFO    MainThread:32141 [wandb_init.py:init():789] starting run threads in backend
+2023-09-27 11:02:25,214 INFO    MainThread:32141 [wandb_run.py:_console_start():2152] atexit reg
+2023-09-27 11:02:25,214 INFO    MainThread:32141 [wandb_run.py:_redirect():2007] redirect: SettingsConsole.WRAP_RAW
+2023-09-27 11:02:25,214 INFO    MainThread:32141 [wandb_run.py:_redirect():2072] Wrapping output streams.
+2023-09-27 11:02:25,215 INFO    MainThread:32141 [wandb_run.py:_redirect():2097] Redirects installed.
+2023-09-27 11:02:25,216 INFO    MainThread:32141 [wandb_init.py:init():830] run started, returning control to user process
+2023-09-27 11:02:26,872 INFO    MainThread:32141 [wandb_run.py:_config_callback():1281] config_cb None None {'epochs': 499, 'data': 'clevr', 'batch_size': 16, 'max_queries': 50, 'max_queries_test': 25, 'lr': 0.0001, 'tau_start': 1.0, 'tau_end': 0.2, 'lambd': 0.5, 'seed': 0, 'name': 'attr-CelebA_diff_only', 'mode': 'online', 'tail': '', 'ckpt_path': None, 'save_dir': '/storage/changyu/results/clevr_diff_ip/', 'run_name': 'attr-CelebA_diff_only', 'data_dir': '/storage/changyu/datasets/CelebA/celeba/img_align_celeba', 'num_viz': 4, 'cfg_scale': 3, 'num_workers': 8, 'num_sampling_steps': 300, 'gpu_id': '1', 'load_epoch': 270, 'test': False, 'cond_scale': 3, 'attribute': 'color', 'num_samples': 1, 'constant_t': 0.0, 'sample_ids': [9, 19, 29, 39], 'sample_first_iter': False, 'save_data': False, 'encode_query_features': False, 'restart_training': False, 'random_baseline': False, 'freeze_unet': False, 'train_querier': False, 'no_warmup': False, 'all_queries': False, 'include_gt': False, 'prod': False, 'sampling': 'random', 'max_queries_biased': 40, 'max_queries_random': 40, 'loss_type': 'l2', 'batch_size_test': 4, 'embed_dim': 16, 'cond_dim': 256, 'experiment_type': 'attributes', 'null_val': -10, 'query_mode': 'single_queries', 'cmi': False, 'only_image': False}

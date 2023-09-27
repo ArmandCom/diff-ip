@@ -1,0 +1,141 @@
+{
+    "os": "Linux-4.15.0-43-generic-x86_64-with-glibc2.23",
+    "python": "3.9.17",
+    "heartbeatAt": "2023-09-27T15:02:18.185992",
+    "startedAt": "2023-09-27T15:02:17.586205",
+    "docker": null,
+    "cuda": null,
+    "args": [
+        "--num_workers",
+        "8",
+        "--batch_size",
+        "16",
+        "--run_name",
+        "attr-CelebA_diff_only",
+        "--name",
+        "attr-CelebA_diff_only",
+        "--sampling",
+        "random",
+        "--experiment_type",
+        "attributes",
+        "--data_dir",
+        "/storage/changyu/datasets/CelebA/celeba/img_align_celeba",
+        "--save_dir",
+        "/storage/changyu/results/clevr_diff_ip/",
+        "--gpu_id",
+        "1",
+        "--epoch",
+        "499",
+        "--loss_type",
+        "l2",
+        "--load_epoch",
+        "270",
+        "--sample_ids",
+        "9",
+        "19",
+        "29",
+        "39"
+    ],
+    "state": "running",
+    "program": "/home/changyu/diff_ip_attr/main_clevr.py",
+    "codePath": "main_clevr.py",
+    "host": "lambda-quad1",
+    "username": "changyu",
+    "executable": "/home/changyu/anaconda3/envs/clevr_diff_ip/bin/python",
+    "cpu_count": 6,
+    "cpu_count_logical": 12,
+    "cpu_freq": {
+        "current": 1905.1961666666666,
+        "min": 1200.0,
+        "max": 4000.0
+    },
+    "cpu_freq_per_core": [
+        {
+            "current": 1199.178,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 1497.219,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 1998.98,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 3697.915,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 1199.279,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 2020.806,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 1199.342,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 1498.693,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 1999.341,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 3697.594,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 1199.361,
+            "min": 1200.0,
+            "max": 4000.0
+        },
+        {
+            "current": 1215.799,
+            "min": 1200.0,
+            "max": 4000.0
+        }
+    ],
+    "disk": {
+        "total": 853.3678207397461,
+        "used": 790.4363708496094
+    },
+    "gpu": "NVIDIA GeForce GTX 1080 Ti",
+    "gpu_count": 4,
+    "gpu_devices": [
+        {
+            "name": "NVIDIA GeForce GTX 1080 Ti",
+            "memory_total": 11811160064
+        },
+        {
+            "name": "NVIDIA GeForce GTX 1080 Ti",
+            "memory_total": 11811160064
+        },
+        {
+            "name": "NVIDIA GeForce GTX 1080 Ti",
+            "memory_total": 11811160064
+        },
+        {
+            "name": "NVIDIA GeForce GTX 1080 Ti",
+            "memory_total": 11811160064
+        }
+    ],
+    "memory": {
+        "total": 62.82674789428711
+    }
+}
